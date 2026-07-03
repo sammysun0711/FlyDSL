@@ -218,7 +218,7 @@ def torch_moe_blockscale_ref(
 
     return (out * topk_weight.view(B, -1, 1)).sum(dim=1).to(dtype)
 
-
+"""
 @pytest.mark.parametrize(
     "token, model_dim, inter_dim, E, topk",
     [
@@ -226,6 +226,34 @@ def torch_moe_blockscale_ref(
         pytest.param(32, 7168, 256, 8, 2, id="medium-E8"),
         pytest.param(32, 7168, 256, 256, 8, id="DS-V3-M32", marks=pytest.mark.large_shape),
         pytest.param(128, 7168, 256, 256, 8, id="DS-V3-M128", marks=pytest.mark.large_shape),
+    ],
+)
+"""
+@pytest.mark.parametrize(
+    "token, model_dim, inter_dim, E, topk",
+    [
+        # pytest.param(16, 7168, 256, 8, 2, id="small-E8"),
+        # pytest.param(32, 7168, 256, 8, 2, id="medium-E8"),
+        # pytest.param(32, 7168, 256, 256, 8, id="DS-V3-M32", marks=pytest.mark.large_shape),
+        # pytest.param(128, 7168, 256, 256, 8, id="DS-V3-M128", marks=pytest.mark.large_shape),
+        pytest.param(1, 6144, 256, 384, 8, id="MiMo-V2.5-Pro", marks=pytest.mark.large_shape),
+        pytest.param(2, 6144, 256, 384, 8, id="MiMo-V2.5-Pro", marks=pytest.mark.large_shape),
+        pytest.param(4, 6144, 256, 384, 8, id="MiMo-V2.5-Pro", marks=pytest.mark.large_shape),
+        pytest.param(8, 6144, 256, 384, 8, id="MiMo-V2.5-Pro", marks=pytest.mark.large_shape),
+        pytest.param(16, 6144, 256, 384, 8, id="MiMo-V2.5-Pro", marks=pytest.mark.large_shape),
+        pytest.param(32, 6144, 256, 384, 8, id="MiMo-V2.5-Pro", marks=pytest.mark.large_shape),
+        pytest.param(64, 6144, 256, 384, 8, id="MiMo-V2.5-Pro", marks=pytest.mark.large_shape),
+        pytest.param(128, 6144, 256, 384, 8, id="MiMo-V2.5-Pro", marks=pytest.mark.large_shape),
+        pytest.param(256, 6144, 256, 384, 8, id="MiMo-V2.5-Pro", marks=pytest.mark.large_shape),
+        pytest.param(512, 6144, 256, 384, 8, id="MiMo-V2.5-Pro", marks=pytest.mark.large_shape),
+        pytest.param(1024, 6144, 256, 384, 8, id="MiMo-V2.5-Pro", marks=pytest.mark.large_shape),
+        pytest.param(2048, 6144, 256, 384, 8, id="MiMo-V2.5-Pro", marks=pytest.mark.large_shape),
+        pytest.param(4096, 6144, 256, 384, 8, id="MiMo-V2.5-Pro", marks=pytest.mark.large_shape),
+        pytest.param(8192, 6144, 256, 384, 8, id="MiMo-V2.5-Pro", marks=pytest.mark.large_shape),
+        pytest.param(16384, 6144, 256, 384, 8, id="MiMo-V2.5-Pro", marks=pytest.mark.large_shape),
+        pytest.param(32768, 6144, 256, 384, 8, id="MiMo-V2.5-Pro", marks=pytest.mark.large_shape),
+        pytest.param(65536, 6144, 256, 384, 8, id="MiMo-V2.5-Pro", marks=pytest.mark.large_shape),
+        pytest.param(131072, 6144, 256, 384, 8, id="MiMo-V2.5-Pro", marks=pytest.mark.large_shape),
     ],
 )
 def test_moe_blockscale_e2e(

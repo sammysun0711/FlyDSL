@@ -1116,6 +1116,24 @@ def test_normal_accuracy(
     )
 
 
+def test_mimo_v25_pro_head_192_accuracy() -> None:
+    """Cover MiMo's page-64 MTP query-staging remainder at head size 192."""
+    run_pa_decode_ps_test(
+        context_length=8192,
+        batch_size=32,
+        num_heads=(16, 1),
+        head_size=192,
+        block_size=64,
+        compute_type=dtypes.d_dtypes["fp8"],
+        query_length=4,
+        quant_mode="per_tensor",
+        context_partition_size=256,
+        trans_v=True,
+        kv_varlen=False,
+        sliding_window=0,
+    )
+
+
 @pytest.mark.parametrize("compute_type", ["fp8"])
 @pytest.mark.parametrize("context_partition_size", [256])
 @pytest.mark.parametrize("head_size", [128])

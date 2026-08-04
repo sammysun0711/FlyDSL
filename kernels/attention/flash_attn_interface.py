@@ -777,6 +777,11 @@ def flydsl_flash_attn_func(
         raise ValueError(f"flydsl_flash_attn_func: num_heads ({H}) must be divisible by num_kv_heads ({num_kv_heads})")
     if D < 64 or D % 32 != 0:
         raise ValueError(f"flydsl_flash_attn_func: head_dim ({D}) must be >= 64 and a multiple of 32")
+    if dtype_str == "fp8" and D != 128:
+        raise NotImplementedError(
+            "flydsl_flash_attn_func: dense fp8 supports head_dim=128 only; "
+            f"got {D}. MiMo D192 must use its explicit paged kernel wrapper."
+        )
 
     splitk = num_kv_splits > 1
 

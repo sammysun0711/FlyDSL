@@ -38,6 +38,7 @@ from kernels.common.kernels_common import _if_then, dtype_to_elem_type
 def build_flash_attn_dualwave_swp_fp8_module(
     num_heads,
     head_dim,
+    value_head_dim=None,
     causal=True,
     dtype_str="bf16",
     num_kv_heads=None,
@@ -50,6 +51,8 @@ def build_flash_attn_dualwave_swp_fp8_module(
     num_kv_splits=1,
     varlen=False,
     cross_seqlen=False,
+    paged=False,
+    kv_cache_layout="linear",
 ):
     """Build the gfx950 D=128 dual-wave flash-attention launcher.
 
@@ -58,11 +61,15 @@ def build_flash_attn_dualwave_swp_fp8_module(
     ``[total_kv, H_kv, D]``, and per-batch ranges come from int32
     ``cu_seqlens_q`` / ``cu_seqlens_kv``. fp8 currently stays dense-only."""
     gpu_arch = get_hip_arch()
+    if value_head_dim is None:
+        value_head_dim = head_dim
 
     if not gpu_arch.startswith("gfx950"):
         raise RuntimeError(f"flash_attn_dualwave_swp requires gfx950+ (uses ds_read_tr16_b64), got {gpu_arch}")
-    if head_dim != 128:
-        raise RuntimeError(f"flash_attn_dualwave_swp is D=128 only, got head_dim={head_dim}")
+    if head_dim != 128 and not (paged and head_dim == 192):
+        raise RuntimeError(
+            f"flash_attn_dualwave_swp supports dense D=128 or MiMo paged D=192, got head_dim={head_dim}"
+        )
     if dtype_str not in ("bf16", "f16", "fp8"):
         raise RuntimeError(f"flash_attn_dualwave_swp supports bf16/f16/fp8 only, got dtype={dtype_str}")
     # fp8 is dense-only for now: split-K and packed varlen are not implemented for
@@ -70,8 +77,20 @@ def build_flash_attn_dualwave_swp_fp8_module(
     # would silently produce wrong results.
     if dtype_str == "fp8" and int(num_kv_splits) > 1:
         raise RuntimeError(f"fp8 flash_attn does not support split-K (num_kv_splits={num_kv_splits})")
-    if dtype_str == "fp8" and varlen:
+    if dtype_str == "fp8" and varlen and not paged:
         raise RuntimeError("fp8 flash_attn does not support packed varlen (cu_seqlens)")
+    if paged and (
+        dtype_str != "fp8"
+        or head_dim != 192
+        or value_head_dim not in (128, 192)
+        or kv_cache_layout != "vectorized"
+    ):
+        raise RuntimeError(
+            "MiMo paged flash_attn requires dtype=fp8, head_dim=192, "
+            "value_head_dim in {128,192}, and kv_cache_layout='vectorized'"
+        )
+    if not paged and value_head_dim != head_dim:
+        raise RuntimeError("separate value_head_dim is only supported by the MiMo paged path")
 
     if num_kv_heads is None:
         num_kv_heads = num_heads
@@ -86,6 +105,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
         num_heads,
         num_kv_heads,
         head_dim,
+        value_head_dim=value_head_dim,
         causal=causal,
         waves_per_eu=waves_per_eu,
         daz=daz,
@@ -96,6 +116,8 @@ def build_flash_attn_dualwave_swp_fp8_module(
         num_kv_splits=num_kv_splits,
         varlen=varlen,
         cross_seqlen=cross_seqlen,
+        paged=paged,
+        kv_cache_layout=kv_cache_layout,
     )
     # Builder-level aliases used by SharedStorage and the launch/compile wrappers.
     SPLITK = traits.SPLITK
@@ -103,6 +125,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
     BLOCK_SIZE = traits.BLOCK_SIZE
     HEAD_DIM = traits.HEAD_DIM
     NUM_HEADS_Q = traits.NUM_HEADS_Q
+    PAGED = traits.PAGED
     DEFAULT_STRIDE_Q_N = traits.DEFAULT_STRIDE_Q_N
     DEFAULT_STRIDE_KV_N = traits.DEFAULT_STRIDE_KV_N
     _dualwave_swp_fp8_cache_tag = traits.cache_tag
@@ -122,6 +145,8 @@ def build_flash_attn_dualwave_swp_fp8_module(
         DebugCounts: fx.Tensor,
         CuSeqQ: fx.Tensor,
         CuSeqKv: fx.Tensor,
+        PageIndptr: fx.Tensor,
+        PageIndices: fx.Tensor,
         QDescale: fx.Tensor,
         KDescale: fx.Tensor,
         VDescale: fx.Tensor,
@@ -150,6 +175,8 @@ def build_flash_attn_dualwave_swp_fp8_module(
             stride_q_n,
             stride_kv_n,
             head_dim_runtime,
+            PageIndptr,
+            PageIndices,
         )
         ctx.init_types_and_constants()
         ctx.init_runtime_indices()
@@ -636,7 +663,11 @@ def build_flash_attn_dualwave_swp_fp8_module(
             # 128b stores fuse this lane and its half-wave partner, so each pair
             # covers 8 contiguous columns instead of two 64b stores.
             if const_expr(not SPLITK):
-                output_store.store_final_o(v_o, q_row)
+                if const_expr(traits.VARLEN):
+                    with _if_then(_scf.IfOp(_raw(ArithValue(q_row < ctx.seqlen_q_v)))):
+                        output_store.store_final_o(v_o, q_row)
+                else:
+                    output_store.store_final_o(v_o, q_row)
             else:
                 output_store.store_splitk_partial_o(v_o, m_row, l_row, q_row)
 
@@ -680,6 +711,8 @@ def build_flash_attn_dualwave_swp_fp8_module(
         DebugCounts: fx.Tensor,
         CuSeqQ: fx.Tensor,
         CuSeqKv: fx.Tensor,
+        PageIndptr: fx.Tensor,
+        PageIndices: fx.Tensor,
         QDescale: fx.Tensor,
         KDescale: fx.Tensor,
         VDescale: fx.Tensor,
@@ -718,6 +751,8 @@ def build_flash_attn_dualwave_swp_fp8_module(
             DebugCounts,
             CuSeqQ,
             CuSeqKv,
+            PageIndptr,
+            PageIndices,
             QDescale,
             KDescale,
             VDescale,
@@ -769,6 +804,8 @@ def build_flash_attn_dualwave_swp_fp8_module(
         workspace=None,
         cu_seqlens_q=None,
         cu_seqlens_kv=None,
+        page_indptr=None,
+        page_indices=None,
         q_descale=None,
         k_descale=None,
         v_descale=None,
@@ -795,6 +832,12 @@ def build_flash_attn_dualwave_swp_fp8_module(
             cu_seqlens_q = O
         if cu_seqlens_kv is None:
             cu_seqlens_kv = O
+        if page_indptr is None:
+            page_indptr = O
+        if page_indices is None:
+            page_indices = O
+        if PAGED and (page_indptr is O or page_indices is O):
+            raise ValueError("paged fp8 flash_attn requires page_indptr and page_indices")
         # Per-tensor fp8 descales (shape-[1] fp32). The kernel only reads them on
         # the fp8 path; bf16/f16 launches pass O as an unused placeholder.
         if q_descale is None:
@@ -813,6 +856,8 @@ def build_flash_attn_dualwave_swp_fp8_module(
                     debug_counts,
                     cu_seqlens_q,
                     cu_seqlens_kv,
+                    page_indptr,
+                    page_indices,
                     q_descale,
                     k_descale,
                     v_descale,
@@ -831,6 +876,8 @@ def build_flash_attn_dualwave_swp_fp8_module(
                 debug_counts,
                 cu_seqlens_q,
                 cu_seqlens_kv,
+                page_indptr,
+                page_indices,
                 q_descale,
                 k_descale,
                 v_descale,
@@ -859,6 +906,8 @@ def build_flash_attn_dualwave_swp_fp8_module(
         workspace=None,
         cu_seqlens_q=None,
         cu_seqlens_kv=None,
+        page_indptr=None,
+        page_indices=None,
         q_descale=None,
         k_descale=None,
         v_descale=None,
@@ -882,6 +931,10 @@ def build_flash_attn_dualwave_swp_fp8_module(
             cu_seqlens_q = O
         if cu_seqlens_kv is None:
             cu_seqlens_kv = O
+        if page_indptr is None:
+            page_indptr = O
+        if page_indices is None:
+            page_indices = O
         if q_descale is None:
             q_descale = O
         if k_descale is None:
@@ -898,6 +951,8 @@ def build_flash_attn_dualwave_swp_fp8_module(
                 debug_counts,
                 cu_seqlens_q,
                 cu_seqlens_kv,
+                page_indptr,
+                page_indices,
                 q_descale,
                 k_descale,
                 v_descale,

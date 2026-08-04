@@ -3471,5 +3471,24 @@ def test_return_lse_rejects_fp8():
         )
 
 
+def test_dense_fp8_public_api_rejects_non_d128():
+    q = torch.zeros((1, 8, 2, 192), dtype=torch.float8_e4m3fn, device="cuda")
+    k = torch.zeros((1, 8, 1, 192), dtype=torch.float8_e4m3fn, device="cuda")
+    v = torch.zeros_like(k)
+    descale = torch.ones(1, dtype=torch.float32, device="cuda")
+
+    with pytest.raises(NotImplementedError, match="dense fp8 supports head_dim=128 only"):
+        flydsl_flash_attn_func(
+            q,
+            k,
+            v,
+            causal=True,
+            num_kv_heads=1,
+            q_descale=descale,
+            k_descale=descale,
+            v_descale=descale,
+        )
+
+
 if __name__ == "__main__":
     main()

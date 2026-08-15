@@ -15,6 +15,10 @@ from kernels.attention.pa_decode_tile import (
     pa_decode_tile,
 )
 
+pytestmark = [pytest.mark.l2_device, pytest.mark.rocm_lower]
+
+if not torch.cuda.is_available():
+    pytest.skip("requires a ROCm GPU", allow_module_level=True)
 
 ARCH = str(get_rocm_arch()).split(":", 1)[0]
 
@@ -31,9 +35,7 @@ def _torch_reference(
     head_dim = query.shape[-1]
     num_q_heads = query.shape[1]
     token_positions = torch.arange(context_length, device=query.device)
-    causal_limit = context_length - query_length + torch.arange(
-        query_length, device=query.device
-    )
+    causal_limit = context_length - query_length + torch.arange(query_length, device=query.device)
     causal_mask = token_positions[None, :] <= causal_limit[:, None]
     for sequence in range(block_tables.shape[0]):
         physical_pages = block_tables[sequence].long()
@@ -51,19 +53,11 @@ def _torch_reference(
             .float()
             .expand(-1, num_q_heads, -1)
         )
-        query_seq = query[
-            sequence * query_length : (sequence + 1) * query_length
-        ].float()
-        logits = torch.einsum("qhd,khd->hqk", query_seq, key_seq) * (
-            head_dim**-0.5
-        )
+        query_seq = query[sequence * query_length : (sequence + 1) * query_length].float()
+        logits = torch.einsum("qhd,khd->hqk", query_seq, key_seq) * (head_dim**-0.5)
         logits.masked_fill_(~causal_mask[None, :, :], float("-inf"))
         probabilities = torch.softmax(logits, dim=-1)
-        outputs.append(
-            torch.einsum("hqk,khd->qhd", probabilities, value_seq).to(
-                torch.bfloat16
-            )
-        )
+        outputs.append(torch.einsum("hqk,khd->qhd", probabilities, value_seq).to(torch.bfloat16))
     return torch.cat(outputs)
 
 
@@ -98,12 +92,10 @@ def test_mimo_bf16_vectorized_5d_matches_torch(query_length: int) -> None:
         dtype=torch.bfloat16,
         device="cuda",
     ).uniform_(-1.0, 1.0, generator=generator)
-    block_tables = torch.arange(
-        num_blocks - 1, -1, -1, dtype=torch.int32, device="cuda"
-    ).reshape(batch, blocks_per_sequence)
-    context_lengths = torch.full(
-        (batch,), context_length, dtype=torch.int32, device="cuda"
+    block_tables = torch.arange(num_blocks - 1, -1, -1, dtype=torch.int32, device="cuda").reshape(
+        batch, blocks_per_sequence
     )
+    context_lengths = torch.full((batch,), context_length, dtype=torch.int32, device="cuda")
 
     expected = _torch_reference(
         query,
@@ -131,9 +123,52 @@ def test_mimo_bf16_vectorized_5d_matches_torch(query_length: int) -> None:
         num_partitions=flydsl_partitions,
         pmax=torch.empty(flydsl_shape, dtype=torch.float32, device="cuda"),
         psum=torch.empty(flydsl_shape, dtype=torch.float32, device="cuda"),
-        pout=torch.empty(
-            (*flydsl_shape, head_dim), dtype=torch.bfloat16, device="cuda"
-        ),
+        pout=torch.empty((*flydsl_shape, head_dim), dtype=torch.bfloat16, device="cuda"),
+    )
+    torch.cuda.synchronize()
+
+    assert bool(torch.isfinite(actual).all().item())
+    torch.testing.assert_close(actual, expected, rtol=5.0e-3, atol=5.0e-3)
+
+
+@pytest.mark.large_shape
+def test_mimo_bf16_vectorized_5d_supports_64_bit_page_offsets() -> None:
+    num_q_heads = 16
+    num_kv_heads = 1
+    head_dim = 192
+    page_size = 64
+    page_bytes = num_kv_heads * head_dim * page_size * torch.bfloat16.itemsize
+    high_page = math.ceil(2**31 / page_bytes)
+    num_blocks = high_page + 1
+    generator = torch.Generator(device="cuda").manual_seed(20260815)
+
+    query = torch.empty((1, num_q_heads, head_dim), dtype=torch.bfloat16, device="cuda").uniform_(
+        -1.0, 1.0, generator=generator
+    )
+    key = torch.empty(
+        (num_blocks, num_kv_heads, head_dim // 8, page_size, 8), dtype=torch.bfloat16, device="cuda"
+    )
+    value = torch.empty(
+        (num_blocks, num_kv_heads, page_size // 8, head_dim, 8), dtype=torch.bfloat16, device="cuda"
+    )
+    key[high_page].uniform_(-1.0, 1.0, generator=generator)
+    value[high_page].uniform_(-1.0, 1.0, generator=generator)
+    block_tables = torch.tensor([[high_page]], dtype=torch.int32, device="cuda")
+    context_lengths = torch.ones(1, dtype=torch.int32, device="cuda")
+
+    expected = _torch_reference(query, key, value, block_tables, context_length=1, query_length=1)
+    actual = torch.full_like(query, float("nan"))
+    pa_decode_tile(
+        output=actual,
+        query=query,
+        key_cache=key,
+        value_cache=value,
+        block_tables=block_tables,
+        context_lengths=context_lengths,
+        key_scale=None,
+        value_scale=None,
+        softmax_scale=head_dim**-0.5,
+        num_partitions=1,
     )
     torch.cuda.synchronize()
 

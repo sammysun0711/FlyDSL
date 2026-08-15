@@ -18,6 +18,7 @@ CDNA_ONLY_TESTS = frozenset(
         "test_pa.py",
         "test_quant.py",
         "test_allreduce.py",  # custom_all_reduce requires CDNA (gfx9xx)
+        "test_pa_decode_tile_bf16.py",
     }
 )
 

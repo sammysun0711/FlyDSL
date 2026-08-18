@@ -127,6 +127,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
     NUM_HEADS_Q = traits.NUM_HEADS_Q
     PAGED = traits.PAGED
     DEFAULT_STRIDE_Q_N = traits.DEFAULT_STRIDE_Q_N
+    DEFAULT_STRIDE_O_N = traits.NUM_HEADS_Q * traits.V_HEAD_DIM
     DEFAULT_STRIDE_KV_N = traits.DEFAULT_STRIDE_KV_N
     _dualwave_swp_fp8_cache_tag = traits.cache_tag
     _lds_elem_dtype = dtype_to_elem_type(traits.DTYPE_STR)
@@ -153,6 +154,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
         seq_len: fx.Int32,
         seq_len_kv: fx.Int32,
         stride_q_n: fx.Int32,
+        stride_o_n: fx.Int32,
         stride_kv_n: fx.Int32,
         head_dim_runtime: fx.Int32,
     ):
@@ -173,6 +175,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
             seq_len,
             seq_len_kv,
             stride_q_n,
+            stride_o_n,
             stride_kv_n,
             head_dim_runtime,
             PageIndptr,
@@ -720,6 +723,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
         seq_len: fx.Int32,
         seq_len_kv: fx.Int32,
         stride_q_n: fx.Int32,
+        stride_o_n: fx.Int32,
         stride_kv_n: fx.Int32,
         head_dim_runtime: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
@@ -759,6 +763,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
             seq_len,
             seq_len_kv,
             stride_q_n,
+            stride_o_n,
             stride_kv_n,
             head_dim_runtime,
             value_attrs={
@@ -773,7 +778,9 @@ def build_flash_attn_dualwave_swp_fp8_module(
         )
         if const_expr(SPLITK):
             combine_rows = bs_idx * NUM_HEADS_Q * sl_idx
-            flash_attn_splitk_combine_kernel(O, DebugCounts, batch_size, seq_len, stride_q_n).launch(
+            flash_attn_splitk_combine_kernel(
+                O, DebugCounts, batch_size, seq_len, stride_o_n
+            ).launch(
                 grid=(combine_rows // COMBINE_ROWS_PER_BLOCK, 1, 1),
                 block=(COMBINE_BLOCK, 1, 1),
                 stream=stream,
@@ -797,6 +804,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
         seq_len,
         stride_kv_n=None,
         stride_q_n=None,
+        stride_o_n=None,
         head_dim_runtime=None,
         debug_counts=None,
         *,
@@ -815,6 +823,8 @@ def build_flash_attn_dualwave_swp_fp8_module(
             stride_kv_n = DEFAULT_STRIDE_KV_N
         if stride_q_n is None:
             stride_q_n = DEFAULT_STRIDE_Q_N
+        if stride_o_n is None:
+            stride_o_n = DEFAULT_STRIDE_O_N
         if head_dim_runtime is None:
             head_dim_runtime = HEAD_DIM
         # seq_len_kv defaults to seq_len (self-attention / equal Q,KV lengths).
@@ -865,6 +875,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
                     seq_len,
                     seq_len_kv,
                     stride_q_n,
+                    stride_o_n,
                     stride_kv_n,
                     head_dim_runtime,
                 )
@@ -885,6 +896,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
                 seq_len,
                 seq_len_kv,
                 stride_q_n,
+                stride_o_n,
                 stride_kv_n,
                 head_dim_runtime,
                 stream=stream,
@@ -899,6 +911,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
         seq_len,
         stride_kv_n=None,
         stride_q_n=None,
+        stride_o_n=None,
         head_dim_runtime=None,
         debug_counts=None,
         *,
@@ -917,6 +930,8 @@ def build_flash_attn_dualwave_swp_fp8_module(
             stride_kv_n = DEFAULT_STRIDE_KV_N
         if stride_q_n is None:
             stride_q_n = DEFAULT_STRIDE_Q_N
+        if stride_o_n is None:
+            stride_o_n = DEFAULT_STRIDE_O_N
         if head_dim_runtime is None:
             head_dim_runtime = HEAD_DIM
         if seq_len_kv is None:
@@ -960,6 +975,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
                 seq_len,
                 seq_len_kv,
                 stride_q_n,
+                stride_o_n,
                 stride_kv_n,
                 head_dim_runtime,
                 fx.Stream(stream),

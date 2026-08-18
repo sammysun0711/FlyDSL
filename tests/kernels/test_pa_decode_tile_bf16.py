@@ -33,6 +33,7 @@ def _torch_reference(
 ) -> torch.Tensor:
     outputs = []
     head_dim = query.shape[-1]
+    value_head_dim = value.shape[3]
     num_q_heads = query.shape[1]
     token_positions = torch.arange(context_length, device=query.device)
     causal_limit = context_length - query_length + torch.arange(query_length, device=query.device)
@@ -49,7 +50,7 @@ def _torch_reference(
         value_seq = (
             value[physical_pages]
             .permute(0, 2, 4, 1, 3)
-            .reshape(-1, value.shape[1], head_dim)[:context_length]
+            .reshape(-1, value.shape[1], value_head_dim)[:context_length]
             .float()
             .expand(-1, num_q_heads, -1)
         )
@@ -66,7 +67,10 @@ def _torch_reference(
     reason=f"the MiMo BF16 vectorized-5D specialization requires gfx942/gfx950, got {ARCH}",
 )
 @pytest.mark.parametrize("query_length", [1, 4])
-def test_mimo_bf16_vectorized_5d_matches_torch(query_length: int) -> None:
+@pytest.mark.parametrize("value_head_dim", [128, 192])
+def test_mimo_bf16_vectorized_5d_matches_torch(
+    query_length: int, value_head_dim: int
+) -> None:
     batch = 2
     num_q_heads = 16
     num_kv_heads = 1
@@ -88,7 +92,7 @@ def test_mimo_bf16_vectorized_5d_matches_torch(query_length: int) -> None:
         device="cuda",
     ).uniform_(-1.0, 1.0, generator=generator)
     value = torch.empty(
-        (num_blocks, num_kv_heads, page_size // 8, head_dim, 8),
+        (num_blocks, num_kv_heads, page_size // 8, value_head_dim, 8),
         dtype=torch.bfloat16,
         device="cuda",
     ).uniform_(-1.0, 1.0, generator=generator)
@@ -109,7 +113,12 @@ def test_mimo_bf16_vectorized_5d_matches_torch(query_length: int) -> None:
     equivalent_group = query_length * num_q_heads // num_kv_heads
     flydsl_partitions = 4
     flydsl_shape = (batch, num_kv_heads, flydsl_partitions, equivalent_group)
-    actual = torch.full_like(query, float("nan"))
+    actual = torch.full(
+        (batch * query_length, num_q_heads, value_head_dim),
+        float("nan"),
+        dtype=query.dtype,
+        device=query.device,
+    )
     pa_decode_tile(
         output=actual,
         query=query,
@@ -123,7 +132,11 @@ def test_mimo_bf16_vectorized_5d_matches_torch(query_length: int) -> None:
         num_partitions=flydsl_partitions,
         pmax=torch.empty(flydsl_shape, dtype=torch.float32, device="cuda"),
         psum=torch.empty(flydsl_shape, dtype=torch.float32, device="cuda"),
-        pout=torch.empty((*flydsl_shape, head_dim), dtype=torch.bfloat16, device="cuda"),
+        pout=torch.empty(
+            (*flydsl_shape, value_head_dim),
+            dtype=torch.bfloat16,
+            device="cuda",
+        ),
     )
     torch.cuda.synchronize()
 

@@ -9,8 +9,8 @@ SGLang/AITER's SHUFFLE 5D page layout, and O is BF16:
 
 * Q: ``[total_q, 16, 192]``
 * K: ``[num_pages, 1, 12, 64, 16]``
-* V: ``[num_pages, 1, 4, 192, 16]``
-* O: ``[total_q, 16, 192]``
+* V: ``[num_pages, 1, 4, 128, 16]``
+* O: ``[total_q, 16, 128]``
 
 ``q_indptr`` and ``kv_indptr`` contain cumulative query/KV token lengths;
 ``page_indptr`` and ``page_indices`` contain cumulative page counts and the
@@ -121,7 +121,12 @@ def mimo_paged_flash_attn_fp8(
     if value_head_dim not in (MIMO_VALUE_HEAD_DIM, MIMO_HEAD_DIM):
         raise ValueError(f"value_head_dim must be 128 or 192, got {value_head_dim}")
     expected_k_tail = (MIMO_KV_HEADS, MIMO_HEAD_DIM // 16, MIMO_PAGE_SIZE, 16)
-    expected_v_tail = (MIMO_KV_HEADS, MIMO_PAGE_SIZE // 16, MIMO_HEAD_DIM, 16)
+    expected_v_tail = (
+        MIMO_KV_HEADS,
+        MIMO_PAGE_SIZE // 16,
+        value_head_dim,
+        16,
+    )
     if k_cache.ndim != 5 or tuple(k_cache.shape[1:]) != expected_k_tail:
         raise ValueError(f"K cache must have tail {expected_k_tail}, got {tuple(k_cache.shape)}")
     if v_cache.ndim != 5 or tuple(v_cache.shape[1:]) != expected_v_tail:
@@ -156,11 +161,18 @@ def mimo_paged_flash_attn_fp8(
     q_descale = _require_descale("q_descale", q_descale, q.device)
     k_descale = _require_descale("k_descale", k_descale, q.device)
     v_descale = _require_descale("v_descale", v_descale, q.device)
+    expected_out_shape = (q.shape[0], MIMO_Q_HEADS, value_head_dim)
     if out is None:
-        out = torch.empty(q.shape, dtype=torch.bfloat16, device=q.device)
-    if out.shape != q.shape or out.dtype != torch.bfloat16 or not out.is_contiguous():
+        out = torch.empty(
+            expected_out_shape, dtype=torch.bfloat16, device=q.device
+        )
+    if (
+        out.shape != expected_out_shape
+        or out.dtype != torch.bfloat16
+        or not out.is_contiguous()
+    ):
         raise ValueError(
-            f"out must be contiguous BF16 with shape {tuple(q.shape)}, "
+            f"out must be contiguous BF16 with shape {expected_out_shape}, "
             f"got shape={tuple(out.shape)} dtype={out.dtype}"
         )
 
@@ -190,6 +202,7 @@ def mimo_paged_flash_attn_fp8(
         int(max_seqlen_q),
         seq_len_kv=int(max_seqlen_kv),
         stride_q_n=MIMO_Q_HEADS * MIMO_HEAD_DIM,
+        stride_o_n=MIMO_Q_HEADS * value_head_dim,
         stride_kv_n=MIMO_KV_HEADS * MIMO_HEAD_DIM,
         head_dim_runtime=MIMO_HEAD_DIM,
         cu_seqlens_q=q_indptr,

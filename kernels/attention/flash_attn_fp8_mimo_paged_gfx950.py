@@ -9,8 +9,10 @@ SGLang/AITER's SHUFFLE 5D page layout, and O is BF16:
 
 * Q: ``[total_q, 16, 192]``
 * K: ``[num_pages, 1, 12, 64, 16]``
-* V: ``[num_pages, 1, 4, 128, 16]``
-* O: ``[total_q, 16, 128]``
+* V: ``[num_pages, 1, 4, value_head_dim, 16]``
+* O: ``[total_q, 16, value_head_dim]``
+
+``value_head_dim`` may be 128 or 192 and is inferred from ``v_cache`` when omitted.
 
 ``q_indptr`` and ``kv_indptr`` contain cumulative query/KV token lengths;
 ``page_indptr`` and ``page_indices`` contain cumulative page counts and the
@@ -103,7 +105,7 @@ def mimo_paged_flash_attn_fp8(
     setprio: bool = True,
     enable_stagger: bool = True,
     lazy_rescale: bool = True,
-    value_head_dim: int = MIMO_VALUE_HEAD_DIM,
+    value_head_dim: int | None = None,
     stream=None,
 ) -> torch.Tensor:
     """Run exact MiMo D192 paged causal attention on gfx950."""
@@ -118,6 +120,10 @@ def mimo_paged_flash_attn_fp8(
             f"q must be OCP E4M3 [total_q,{MIMO_Q_HEADS},{MIMO_HEAD_DIM}], "
             f"got shape={tuple(q.shape)} dtype={q.dtype}"
         )
+    if value_head_dim is None:
+        if v_cache.ndim != 5:
+            raise ValueError(f"V cache must be rank 5, got shape {tuple(v_cache.shape)}")
+        value_head_dim = v_cache.shape[-2]
     if value_head_dim not in (MIMO_VALUE_HEAD_DIM, MIMO_HEAD_DIM):
         raise ValueError(f"value_head_dim must be 128 or 192, got {value_head_dim}")
     expected_k_tail = (MIMO_KV_HEADS, MIMO_HEAD_DIM // 16, MIMO_PAGE_SIZE, 16)

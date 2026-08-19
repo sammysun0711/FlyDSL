@@ -77,7 +77,6 @@ def test_mimo_paged_fp8_cached_prefill_native_value_head(
         q_descale=query_descale,
         k_descale=key_descale,
         v_descale=value_descale,
-        value_head_dim=value_head_dim,
     )
 
     expected = []

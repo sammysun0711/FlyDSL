@@ -11,18 +11,19 @@ keep the online-softmax max/sum and MFMA accumulation in f32.
 ``key_scale``/``value_scale`` are either a ``[1]`` per-tensor scalar or a
 ``[num_blocks, num_kv_heads, block_size]`` per-token tensor (chosen by rank).
 
-``block_size`` (16/64) and ``head_dim`` (multiple of 64) are compile-time
-constants. Layouts are logical, not production's preshuffle.
+``block_size`` (16/64), Q/K ``head_dim``, and ``v_head_dim`` (both multiples
+of 64) are compile-time constants. Layouts are logical, not production's
+preshuffle.
 
 * ``query``        [num_seqs, num_q_heads, head_dim]  f16/bf16 (head_dim contiguous)
 * ``key_cache``    [num_blocks, num_kv_heads, head_dim//16, block_size, 16] fp8
                    or [num_blocks, num_kv_heads, head_dim//8, block_size, 8] bf16
-* ``value_cache``  [num_blocks, num_kv_heads, block_size//16, head_dim, 16] fp8
-                   or [num_blocks, num_kv_heads, block_size//8, head_dim, 8] bf16
-                   (fp8 also supports [num_blocks, num_kv_heads, head_dim, block_size])
+* ``value_cache``  [num_blocks, num_kv_heads, block_size//16, v_head_dim, 16] fp8
+                   or [num_blocks, num_kv_heads, block_size//8, v_head_dim, 8] bf16
+                   (fp8 also supports [num_blocks, num_kv_heads, v_head_dim, block_size])
 * ``block_tables`` [num_seqs, max_blocks_per_seq]  int32
 * ``context_lengths`` [num_seqs]  int32
-* ``output``       [num_seqs, num_q_heads, head_dim]  same dtype as query
+* ``output``       [num_seqs, num_q_heads, v_head_dim]  same dtype as query
 
 One CTA (4 waves) per (seq, kv_head) runs a flash-style online softmax over
 256-token blocks; the 4 waves split tokens for Q·Kᵀ and head-dim for P·V, with
@@ -61,6 +62,7 @@ BF16_KV_SUPPORTED_ARCHS = ("gfx942", "gfx950")
 def compile_pa_decode_tile(
     *,
     head_dim: int,
+    v_head_dim: int | None = None,
     query_group_size: int,
     block_size: int,
     num_partitions: int = 1,
@@ -73,9 +75,10 @@ def compile_pa_decode_tile(
 ):
     """Build the tile-programming PA-decode kernel + launch wrapper.
 
-    ``block_size``, ``head_dim``, and ``query_dtype`` are compile-time
-    constants (lru_cache keys). ``query_length`` (MTP) and ``query_group_size``
-    flatten into ``TOTAL_ROWS = query_length * query_group_size``, tiled into
+    ``block_size``, Q/K ``head_dim``, ``v_head_dim``, and ``query_dtype`` are
+    compile-time constants (lru_cache keys). ``query_length`` (MTP) and
+    ``query_group_size`` flatten into
+    ``TOTAL_ROWS = query_length * query_group_size``, tiled into
     ``M_TILES = ceil(TOTAL_ROWS / 16)`` independent 16-row MFMA tiles; each
     extra M-tile duplicates loop-carried state, so VGPR/LDS/occupancy scale
     roughly linearly with ``M_TILES``.
@@ -84,6 +87,9 @@ def compile_pa_decode_tile(
     is_gfx950 = "gfx95" in arch
     FP8 = fx.Float8E4M3FN if is_gfx950 else fx.Float8E4M3FNUZ
     FP8_MAX = 448.0 if is_gfx950 else 240.0  # max representable magnitude of the format above
+
+    if v_head_dim is None:
+        v_head_dim = head_dim
 
     assert head_dim % MFMA_MNK == 0, f"head_dim {head_dim} must be a multiple of {MFMA_MNK}"
     assert block_size in (16, 64), f"pa_decode_tile only supports block_size in (16, 64), got {block_size}"
@@ -101,18 +107,24 @@ def compile_pa_decode_tile(
         assert query_dtype == "bf16", "BF16 KV MFMA requires a BF16 query"
 
     assert head_dim % 64 == 0, f"pa_decode_tile only supports head_dim that's a multiple of 64, got {head_dim}"
+    assert v_head_dim % 64 == 0, (
+        "pa_decode_tile only supports v_head_dim that's a multiple of 64, "
+        f"got {v_head_dim}"
+    )
     assert query_length >= 1, f"query_length must be >= 1, got {query_length}"
     # Flattened query-row axis (MTP outer, GQA head inner), tiled into 16-row M-tiles.
     TOTAL_ROWS = query_length * query_group_size
     M_TILES = cdiv(TOTAL_ROWS, MFMA_MNK)
     ROWS_PADDED = M_TILES * MFMA_MNK
-    # PV layout: V=A, P=B -> output [head-dim (row), query-row (col=lane16)],
-    # generalized over head_dim via the VHE_CHUNKS loop.
+    # PV layout: V=A, P=B -> output [V-head-dim (row), query-row (col=lane16)],
+    # generalized over v_head_dim via the VHE_CHUNKS loop.
     NWARP = 4  # 4 waves / CTA
     TOK_PER_WARP = 64  # tokens each warp owns per compute block (matches production KV_COMPUTE_BLOCK)
     TILE_TOK = NWARP * TOK_PER_WARP  # 256 tokens / compute block
     PAGES_PER_CHUNK = TOK_PER_WARP // block_size  # pages spanned by one 64-token warp-chunk: 1 (bs=64) or 4 (bs=16)
-    assert head_dim % (NWARP * MFMA_MNK) == 0, "head_dim must split across the 4 warps for PV"
+    assert v_head_dim % (NWARP * MFMA_MNK) == 0, (
+        "v_head_dim must split across the 4 warps for PV"
+    )
 
     # head_dim splits into 16-element chunks (QK_CHUNK_ELEMS, one dwordx4 load);
     # RGROUP_QUARTERS of them make a 64-element fetch group, QKHE_LOOP groups total.
@@ -130,7 +142,7 @@ def compile_pa_decode_tile(
     QCHUNK = head_dim // NQCHUNK  # f16 elements per lane's load chunk (8 for head_dim=128, 4 for head_dim=64)
     assert QCHUNK % 4 == 0, f"head_dim {head_dim} must provide a whole number of packed FP8 query words"
 
-    VHE_CHUNKS = head_dim // (NWARP * MFMA_MNK)  # 2 for head_dim=128, 1 for head_dim=64
+    VHE_CHUNKS = v_head_dim // (NWARP * MFMA_MNK)
 
     if softmax_scale is None:
         softmax_scale = 1.0 / (head_dim**0.5)
@@ -181,11 +193,11 @@ def compile_pa_decode_tile(
 
     @flyc.kernel(known_block_size=(BLOCK_THREADS, 1, 1))
     def pa_decode_tile_kernel(
-        output_ptr: fx.Tensor,  # [num_seqs*query_length, num_q_heads, head_dim]  (written directly when NP==1)
+        output_ptr: fx.Tensor,  # [num_seqs*query_length, num_q_heads, v_head_dim]  (written directly when NP==1)
         # per-partition partial outputs (combined by the reduce kernel when NP>1):
         pmax_ptr: fx.Tensor,  # [num_seqs*query_length, num_kv_heads, num_partitions, query_group_size]   row max
         psum_ptr: fx.Tensor,  # [num_seqs*query_length, num_kv_heads, num_partitions, query_group_size]   row sum
-        pout_ptr: fx.Tensor,  # [num_seqs*query_length, num_kv_heads, num_partitions, query_group_size, head_dim] Q_DTYPE, normalized O_p/l_p
+        pout_ptr: fx.Tensor,  # [num_seqs*query_length, num_kv_heads, num_partitions, query_group_size, v_head_dim] Q_DTYPE, normalized O_p/l_p
         query_ptr: fx.Tensor,  # [num_seqs*query_length, num_q_heads, head_dim] -- row = seq*query_length + qi (MTP position)
         key_cache_ptr: fx.Tensor,  # fp8 vector-16 or bf16 vector-8, see module docstring
         value_cache_ptr: fx.Tensor,  # fp8 vector-16 or bf16 vector-8, see module docstring
@@ -603,8 +615,8 @@ def compile_pa_decode_tile(
         ]
         # P·V is loop-tiled over head-dim (like production's VHELOOP): each
         # step computes O[:, vh*VHE_SIZE:+VHE_SIZE] instead of materializing
-        # the full [16, head_dim] at once.
-        VHE_SIZE = head_dim // VHE_CHUNKS
+        # the full [16, v_head_dim] at once.
+        VHE_SIZE = v_head_dim // VHE_CHUNKS
         OP_ELEMS = MFMA_MNK * VHE_SIZE // (NWARP * WAVE)  # PV C-fragment elements/lane/chunk (probed = 4)
 
         # ── raw V load (B operand) ──
@@ -622,9 +634,9 @@ def compile_pa_decode_tile(
                 for step in range_constexpr(STEPS_PER_PAGE):
                     if const_expr(trans_v):
                         vector_width = 8 if bf16_kv else 16
-                        base = (((phys * n_kv + kv_h) * STEPS_PER_PAGE + step) * head_dim + head_element) * vector_width
+                        base = (((phys * n_kv + kv_h) * STEPS_PER_PAGE + step) * v_head_dim + head_element) * vector_width
                     else:
-                        base = ((phys * n_kv + kv_h) * head_dim + head_element) * block_size + step * 16
+                        base = ((phys * n_kv + kv_h) * v_head_dim + head_element) * block_size + step * 16
                     if const_expr(bf16_kv):
                         words = _v_load_bf16x8_words(base)
                         ops.extend([words[0], words[1]])
@@ -634,7 +646,7 @@ def compile_pa_decode_tile(
                     if const_expr(block_size == 16):
                         # help the scheduler overlap the per-page gathered loads (see _k_ops)
                         fx.rocdl.sched_barrier(fx.rocdl.mask_vmem_rd)
-            if const_expr(head_dim == 64):
+            if const_expr(v_head_dim == 64):
                 fx.rocdl.sched_vmem(len(ops) // 2)
             return ops  # NVOPS i64, the 64-token contiguous run for this head
 
@@ -650,7 +662,7 @@ def compile_pa_decode_tile(
 
         K_SLOT, V_SLOT = 0, 1
         # Per-M-tile loop-carried state after the K/V slots: one output chunk
-        # per VHE_CHUNKS (2 for head_dim=128, 4 for head_dim=256, 1 for 64),
+        # per VHE_CHUNKS (2 for v_head_dim=128, 4 for 256, 1 for 64),
         # then running-max + running-denom.
         STATE_PER_M = VHE_CHUNKS + 2
 
@@ -1070,7 +1082,10 @@ def compile_pa_decode_tile(
                 else:
                     base = ((seq * n_kv + kv_h) * NP + part) * TOTAL_ROWS + row
                     pout_div = fx.logical_divide(pout_ptr, fx.make_layout(OP_ELEMS, 1))
-                    pout_chunk = fx.slice(pout_div, (None, base * (head_dim // OP_ELEMS) + sub))
+                    pout_chunk = fx.slice(
+                        pout_div,
+                        (None, base * (v_head_dim // OP_ELEMS) + sub),
+                    )
                     pout_chunk.store(o_norm)
 
             for vh in range_constexpr(VHE_CHUNKS):
@@ -1161,6 +1176,7 @@ def pa_decode_tile(
     """
     num_seqs = context_lengths.shape[0]
     total_q_rows, num_q_heads, head_dim = query.shape
+    value_head_dim = output.shape[-1]
     assert (
         total_q_rows % num_seqs == 0
     ), f"query.shape[0] ({total_q_rows}) must be a multiple of context_lengths.shape[0] ({num_seqs})"
@@ -1179,16 +1195,19 @@ def pa_decode_tile(
     if trans_v:
         _, v_num_kv_heads, v_subblocks, v_head_dim, v_width = value_cache.shape
         assert (
-            v_head_dim == head_dim
+            v_head_dim == value_head_dim
             and v_width == expected_vector
             and v_subblocks == block_size // expected_vector
-        ), f"value_cache shape {tuple(value_cache.shape)} doesn't match block_size={block_size}, head_dim={head_dim}"
+        ), (
+            f"value_cache shape {tuple(value_cache.shape)} doesn't match "
+            f"block_size={block_size}, value_head_dim={value_head_dim}"
+        )
     else:
         assert not bf16_kv, "BF16 KV requires the vectorized-5D value-cache layout"
         _, v_num_kv_heads, v_head_dim, v_block_size = value_cache.shape
-        assert v_head_dim == head_dim and v_block_size == block_size, (
+        assert v_head_dim == value_head_dim and v_block_size == block_size, (
             f"value_cache shape {tuple(value_cache.shape)} doesn't match "
-            f"block_size={block_size}, head_dim={head_dim}"
+            f"block_size={block_size}, value_head_dim={value_head_dim}"
         )
     assert v_num_kv_heads == num_kv_heads
     assert value_cache.dtype == key_cache.dtype, (
@@ -1207,8 +1226,16 @@ def pa_decode_tile(
     assert (
         output.dtype == query.dtype
     ), f"pa_decode_tile requires output.dtype == query.dtype, got {output.dtype} vs {query.dtype}"
+    assert output.shape == (total_q_rows, num_q_heads, value_head_dim), (
+        "pa_decode_tile output must be [total_q_rows, num_q_heads, value_head_dim], "
+        f"got {tuple(output.shape)}"
+    )
 
     assert query.stride(2) == 1, f"pa_decode_tile requires a contiguous head_dim axis, got strides {query.stride()}"
+    assert output.stride(2) == 1, (
+        "pa_decode_tile requires a contiguous value_head_dim axis, "
+        f"got strides {output.stride()}"
+    )
 
     dev = query.device
     if bf16_kv:
@@ -1267,6 +1294,7 @@ def pa_decode_tile(
 
     compiled = compile_pa_decode_tile(
         head_dim=head_dim,
+        v_head_dim=value_head_dim,
         query_group_size=query_group_size,
         block_size=int(block_size),
         num_partitions=num_partitions,
@@ -1300,14 +1328,22 @@ def pa_decode_tile(
                 )
             pmax = torch.empty(*expected_scalar_shape, dtype=torch.float32, device=dev)
             psum = torch.empty(*expected_scalar_shape, dtype=torch.float32, device=dev)
-            pout = torch.empty(*expected_scalar_shape, head_dim, dtype=output.dtype, device=dev)
+            pout = torch.empty(
+                *expected_scalar_shape,
+                value_head_dim,
+                dtype=output.dtype,
+                device=dev,
+            )
         else:
             assert pmax.shape == expected_scalar_shape, f"pmax shape {tuple(pmax.shape)} != {expected_scalar_shape}"
             assert psum.shape == expected_scalar_shape, f"psum shape {tuple(psum.shape)} != {expected_scalar_shape}"
             assert pout.shape == (
                 *expected_scalar_shape,
-                head_dim,
-            ), f"pout shape {tuple(pout.shape)} != {(*expected_scalar_shape, head_dim)}"
+                value_head_dim,
+            ), (
+                f"pout shape {tuple(pout.shape)} != "
+                f"{(*expected_scalar_shape, value_head_dim)}"
+            )
     s = stream or torch.cuda.current_stream()
 
     _run_compiled(
@@ -1340,7 +1376,7 @@ def pa_decode_tile(
             max_context_partition_num=num_partitions,
             query_seq_len=query_length,
             query_group_size=query_group_size,
-            head_size=head_dim,
+            head_size=value_head_dim,
             output_dtype_str=_get_output_dtype_str(output),
             logits_dtype_str=_get_output_dtype_str(pout),
         )

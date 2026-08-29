@@ -579,11 +579,14 @@ def run_pa_decode_ps_test(
     trans_v: bool,
     kv_varlen: bool,
     sliding_window: int,
+    value_head_size: Optional[int] = None,
+    capture_flydsl: bool = False,
 ) -> Dict[str, Union[float, int, str, bool, Tuple[int, int]]]:
     if not HAS_FLYDSL_PS:
         raise RuntimeError("FlyDSL `pa_decode_ps_launch` is not available.")
     if compute_type != aiter.dtypes.fp8:
         raise ValueError("This PS-only harness only keeps fp8 cases.")
+    value_head_size = head_size if value_head_size is None else value_head_size
     results: Dict[str, Union[float, int, str, bool, Tuple[int, int]]] = {
         "compute_type": dtype_to_name(compute_type),
         "quant_mode": quant_mode,
@@ -596,6 +599,7 @@ def run_pa_decode_ps_test(
         "batch_size": batch_size,
         "query_length": query_length,
         "head_size": head_size,
+        "value_head_size": value_head_size,
         "sliding_window": sliding_window,
         "quant_q": False,
         "quant_kv": True,
@@ -650,6 +654,7 @@ def run_pa_decode_ps_test(
         seed,
         str(device),
         1,
+        value_head_size,
     )
     key_cache = key_caches[0]
     value_cache = value_caches[0]
@@ -694,7 +699,7 @@ def run_pa_decode_ps_test(
         sliding_window=sliding_window,
     ).to(data_type)
     quantized_values = shuffle_value_cache_layout(quantized_values) if trans_v else quantized_values
-    if HAS_GLUON:
+    if HAS_GLUON and value_head_size == head_size:
         max_context_partition_num = get_gluon_partition_count(
             batch_size,
             num_kv_heads,
@@ -714,7 +719,7 @@ def run_pa_decode_ps_test(
         max_logits = torch.empty(intermediate_shape, dtype=torch.float32, device=device)
         temporary_output = torch.empty(
             *intermediate_shape,
-            head_size,
+            value_head_size,
             dtype=reference_output.dtype,
             device=device,
         )
@@ -764,6 +769,7 @@ def run_pa_decode_ps_test(
         kv_indptr,
         num_query_heads,
         num_kv_heads,
+        value_head_size=value_head_size,
         per_token_kv=quant_mode == "per_token",
     )
     ps_key_scale: torch.Tensor = key_scale_original
@@ -795,7 +801,7 @@ def run_pa_decode_ps_test(
     flydsl_max_logits = torch.empty(intermediate_shape, dtype=torch.float32, device=device)
     flydsl_temporary_output = torch.empty(
         *intermediate_shape,
-        head_size,
+        value_head_size,
         dtype=reference_output.dtype,
         device=device,
     )
@@ -827,7 +833,21 @@ def run_pa_decode_ps_test(
     torch.testing.assert_close(flydsl_ps_output, reference_output, atol=ps_tol, rtol=ps_tol)
     print("FlyDSL PS vs Torch PASSED")
 
-    if HAS_GLUON:
+    if capture_flydsl:
+        capture_stream = torch.cuda.Stream()
+        capture_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(capture_stream):
+            flydsl_ps_call()
+        torch.cuda.current_stream().wait_stream(capture_stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=capture_stream):
+            flydsl_ps_call()
+        graph.replay()
+        torch.cuda.current_stream().wait_stream(capture_stream)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(flydsl_ps_output, reference_output, atol=ps_tol, rtol=ps_tol)
+
+    if HAS_GLUON and value_head_size == head_size:
         results["us_gluon"] = gluon_time
 
     results["us_flydsl_ps"] = flydsl_ps_time
@@ -1366,7 +1386,7 @@ def test_pa_decode_ps_rejects_unsupported_bf16_asymmetric_paths(
 
     with pytest.raises(
         ValueError,
-        match="BF16 KV and asymmetric value dimensions currently require",
+        match="BF16 KV currently requires|asymmetric value dimensions are not supported",
     ):
         flydsl_ps_launch(
             output=output,
@@ -1523,14 +1543,21 @@ def test_fp8_cache_offset_above_2gib(
     torch.testing.assert_close(actual, expected, rtol=2.0e-2, atol=2.0e-2)
 
 
-@pytest.mark.parametrize(("query_length", "quant_mode"), [(1, "per_tensor"), (4, "per_token")])
-def test_metadata_accuracy(query_length: int, quant_mode: str) -> None:
+@pytest.mark.parametrize(
+    ("query_length", "quant_mode", "head_size"),
+    [
+        pytest.param(1, "per_tensor", 64, id="d64-qlen1-per-tensor"),
+        pytest.param(1, "per_tensor", 128, id="d128-qlen1-per-tensor"),
+        pytest.param(4, "per_token", 128, id="d128-qlen4-per-token"),
+    ],
+)
+def test_metadata_accuracy(query_length: int, quant_mode: str, head_size: int) -> None:
     """Exercise the block-1024 persistent worklist decode and split reducer."""
     run_pa_decode_ps_test(
         context_length=1027,
         batch_size=3,
         num_heads=(16, 1),
-        head_size=128,
+        head_size=head_size,
         block_size=1024,
         compute_type=dtypes.d_dtypes["fp8"],
         query_length=query_length,
@@ -1540,6 +1567,41 @@ def test_metadata_accuracy(query_length: int, quant_mode: str) -> None:
         kv_varlen=False,
         sliding_window=0,
     )
+
+
+@pytest.mark.l2_device
+@pytest.mark.rocm_lower
+@_requires_tile_pa
+@pytest.mark.parametrize(
+    ("query_length", "quant_mode", "capture_flydsl"),
+    [
+        pytest.param(1, "per_tensor", False, id="qlen1-per-tensor"),
+        pytest.param(4, "per_token", True, id="qlen4-per-token-graph"),
+    ],
+)
+def test_metadata_qk192_v128_accuracy(
+    query_length: int,
+    quant_mode: str,
+    capture_flydsl: bool,
+) -> None:
+    """Cover FP8 page-1024 Q/K192-V128 metadata decode and reduction."""
+    result = run_pa_decode_ps_test(
+        context_length=1027,
+        batch_size=3,
+        num_heads=(16, 1),
+        head_size=192,
+        value_head_size=128,
+        block_size=1024,
+        compute_type=dtypes.d_dtypes["fp8"],
+        query_length=query_length,
+        quant_mode=quant_mode,
+        context_partition_size=256,
+        trans_v=True,
+        kv_varlen=False,
+        sliding_window=0,
+        capture_flydsl=capture_flydsl,
+    )
+    assert result["us_flydsl_ps"] > 0
 
 
 @pytest.mark.parametrize("block_size", [16, 64, 256, 2048])

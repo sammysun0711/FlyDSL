@@ -16,6 +16,7 @@ def _lookup(**overrides):
         "num_query_heads": 16,
         "num_kv_heads": 1,
         "head_dim": 128,
+        "value_head_dim": 128,
         "block_size": 1024,
         "device_tensor": None,
     }
@@ -43,16 +44,18 @@ def test_pa_metadata_tuner_persists_and_runtime_reads(tmp_path, monkeypatch):
         do_bench=bench,
     )
     tuner_args = (81, 648, 4, True, 80, 16, 1, 128, 1024, None, runner)
-    tuner(*tuner_args)
+    tuner(*tuner_args, value_head_dim=128)
 
-    assert tuning.get_cached_config(tuner, *tuner_args).kwargs["grid_multiplier"] == 2
-    config_path = tuning.persistent_config_path(tuner, *tuner_args)
+    assert tuning.get_cached_config(tuner, *tuner_args, value_head_dim=128).kwargs["grid_multiplier"] == 2
+    config_path = tuning.persistent_config_path(tuner, *tuner_args, value_head_dim=128)
     assert config_path == tmp_path / "run_pa_metadata_grid_config.json"
     assert config_path.is_file()
 
     importlib.reload(tuning)
     assert _lookup() == 2
+    assert _lookup(value_head_dim=None) == 2
     assert _lookup(batch_size=32) is None
+    assert _lookup(value_head_dim=64) is None
 
 
 def test_pa_metadata_tuner_key_excludes_context_length():

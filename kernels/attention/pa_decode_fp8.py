@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
 
-"""FlyDSL Paged Attention Decode with Persistent Scheduling — FP8.
+"""FlyDSL paged-attention decode with persistent scheduling.
 
 Persistent scheduling (PS) mode:
 - Grid = (num_SM, 1, 4) so each CTA handles one 256-token sub-tile of a 1024-token KV page
 - Outer work loop iterates over pre-computed worklist from get_pa_metadata_v1
 - Inner KV loop iterates pages from kv_page_indices
 - Supports split-reduce for load balancing across CUs
+- Supports FP8 or vectorized-5D BF16 K/V on the page-1024 metadata path
 
 Requires: aiter's get_pa_metadata_v1 (module_pa_metadata.so)
 """
@@ -77,6 +78,7 @@ def get_pa_metadata(
     head_size = query.shape[-1]
     if value_head_size is None:
         value_head_size = head_size
+    kv_dtype = "bf16" if key_cache.dtype == torch.bfloat16 else "fp8"
 
     props = torch.cuda.get_device_properties(dev)
     num_blocks = key_cache.shape[0]
@@ -91,6 +93,7 @@ def get_pa_metadata(
             num_kv_heads=num_kv_heads,
             head_dim=head_size,
             value_head_dim=value_head_size,
+            kv_dtype=kv_dtype,
             block_size=key_cache.shape[-2],
             device_tensor=query,
         )
@@ -181,6 +184,7 @@ def get_pa_metadata(
         "query_length": query_length,
         "qk_head_size": head_size,
         "value_head_size": value_head_size,
+        "kv_dtype": kv_dtype,
     }
 
 
@@ -246,18 +250,33 @@ def _validate_metadata_cache_shapes(
     value_cache: torch.Tensor,
     output: torch.Tensor,
 ) -> None:
-    """Validate the FP8 metadata-kernel cache layouts."""
+    """Validate the FP8/BF16 metadata-kernel cache layouts."""
     if key_cache.ndim != 5:
         raise ValueError(f"metadata key cache must be 5D, got shape {tuple(key_cache.shape)}")
     if value_cache.ndim not in (4, 5):
         raise ValueError(f"metadata value cache must be 4D or 5D, got shape {tuple(value_cache.shape)}")
-    if key_cache.dtype != value_cache.dtype or key_cache.element_size() != 1:
+    if key_cache.dtype != value_cache.dtype:
         raise ValueError(
-            "metadata decode requires matching FP8 key/value cache dtypes; "
+            "metadata decode requires matching key/value cache dtypes; "
             f"got key={key_cache.dtype}, value={value_cache.dtype}."
         )
 
+    bf16_kv = key_cache.dtype == torch.bfloat16
+    if not bf16_kv and key_cache.element_size() != 1:
+        raise ValueError(f"metadata decode requires FP8 or BF16 K/V, got {key_cache.dtype}.")
+    if bf16_kv:
+        if query.dtype != torch.bfloat16 or output.dtype != torch.bfloat16:
+            raise ValueError("BF16 KV metadata decode requires BF16 query and output tensors.")
+        if value_cache.ndim != 5:
+            raise ValueError("BF16 KV metadata decode requires the vectorized-5D value-cache layout.")
+
     num_blocks, num_kv_heads, key_chunks, block_size, key_vector_width = key_cache.shape
+    expected_vector_width = 8 if bf16_kv else 16
+    if key_vector_width != expected_vector_width:
+        raise ValueError(
+            f"metadata key cache vector width must be {expected_vector_width} for {key_cache.dtype}, "
+            f"got {key_vector_width}."
+        )
     qk_head_size = key_chunks * key_vector_width
     if qk_head_size != query.shape[-1]:
         raise ValueError(f"key cache Q/K head size ({qk_head_size}) must match query head size ({query.shape[-1]}).")
@@ -268,6 +287,11 @@ def _validate_metadata_cache_shapes(
         )
 
     if value_cache.ndim == 5:
+        if value_cache.shape[4] != expected_vector_width:
+            raise ValueError(
+                f"metadata value cache vector width must be {expected_vector_width} for {value_cache.dtype}, "
+                f"got {value_cache.shape[4]}."
+            )
         value_block_size = value_cache.shape[2] * value_cache.shape[4]
         value_head_size = value_cache.shape[3]
     else:
@@ -409,37 +433,37 @@ def pa_decode_ps_launch(
 
     is_bf16_kv = key_cache.dtype == torch.bfloat16
     is_asymmetric = value_head_size != head_size
-    if is_bf16_kv or (is_asymmetric and sliding_window > 0):
-        unsupported_path = "sliding-window" if sliding_window > 0 else "page-1024 metadata"
-        raise ValueError(
-            "BF16 KV currently requires block_size 16 or 64 with sliding_window=0, "
-            "and asymmetric value dimensions are not supported by sliding-window decode; "
-            f"the {unsupported_path} path is not supported."
-        )
+    if sliding_window > 0 and (is_bf16_kv or is_asymmetric):
+        raise ValueError("BF16 KV and asymmetric value dimensions are not supported by sliding-window decode.")
 
     trans_v = len(value_cache.shape) == 5
     query_input_dtype = _get_query_input_dtype(query)
 
-    key_scale = _prepare_scale_tensor(
-        "key_scale",
-        key_scale,
-        device=dev,
-        is_graph_capturing=is_graph_capturing,
-    )
-    value_scale = _prepare_scale_tensor(
-        "value_scale",
-        value_scale,
-        device=dev,
-        is_graph_capturing=is_graph_capturing,
-    )
-    # Detect per-token vs per-tensor quantization from scale tensor
-    # dimensionality: a >1-D scale tensor carries one scale per (block, head,
-    # token), which enables the per-token K/V path in the metadata kernel.
-    per_token_kv = key_scale.ndim > 1
-
-    # Strides for key_scale/value_scale
-    stride_ks_block = key_scale.stride(0) if per_token_kv else 0
-    stride_ks_head = key_scale.stride(1) if per_token_kv else 0
+    if is_bf16_kv:
+        if key_scale is not None or value_scale is not None:
+            raise ValueError("BF16 KV metadata decode requires key_scale and value_scale to be None.")
+        per_token_kv = False
+        stride_ks_block = 0
+        stride_ks_head = 0
+    else:
+        key_scale = _prepare_scale_tensor(
+            "key_scale",
+            key_scale,
+            device=dev,
+            is_graph_capturing=is_graph_capturing,
+        )
+        value_scale = _prepare_scale_tensor(
+            "value_scale",
+            value_scale,
+            device=dev,
+            is_graph_capturing=is_graph_capturing,
+        )
+        # Detect per-token vs per-tensor quantization from scale tensor
+        # dimensionality: a >1-D scale tensor carries one scale per (block,
+        # head, token), which enables the per-token K/V path.
+        per_token_kv = key_scale.ndim > 1
+        stride_ks_block = key_scale.stride(0) if per_token_kv else 0
+        stride_ks_head = key_scale.stride(1) if per_token_kv else 0
 
     if sliding_window > 0 and max_context_partition_num <= 0:
         raise ValueError("max_context_partition_num must be positive for sliding-window decode.")
@@ -586,11 +610,17 @@ def pa_decode_ps_launch(
     _validate_metadata_cache_shapes(query, key_cache, value_cache, output)
     metadata_qk_head_size = metadata.get("qk_head_size", head_size)
     metadata_value_head_size = metadata.get("value_head_size", metadata_qk_head_size)
-    if metadata_qk_head_size != head_size or metadata_value_head_size != value_head_size:
+    metadata_kv_dtype = metadata.get("kv_dtype", "fp8")
+    kv_dtype = "bf16" if is_bf16_kv else "fp8"
+    if (
+        metadata_qk_head_size != head_size
+        or metadata_value_head_size != value_head_size
+        or metadata_kv_dtype != kv_dtype
+    ):
         raise ValueError(
-            "Precomputed page-1024 metadata head dimensions do not match this launch: "
-            f"metadata Q/K={metadata_qk_head_size}, V={metadata_value_head_size}; "
-            f"launch Q/K={head_size}, V={value_head_size}."
+            "Precomputed page-1024 metadata does not match this launch: "
+            f"metadata Q/K={metadata_qk_head_size}, V={metadata_value_head_size}, KV={metadata_kv_dtype}; "
+            f"launch Q/K={head_size}, V={value_head_size}, KV={kv_dtype}."
         )
 
     work_indptr = metadata["work_indptr"]
@@ -612,6 +642,7 @@ def pa_decode_ps_launch(
         query_input_dtype=query_input_dtype,
         head_dim=int(head_size),
         value_head_dim=int(value_head_size),
+        kv_dtype=kv_dtype,
         block_size=int(metadata_block_size),
         output_dtype_str=_get_output_dtype_str(output),
     )
@@ -628,8 +659,8 @@ def pa_decode_ps_launch(
         key_cache.data_ptr(),
         value_cache.data_ptr(),
         context_lengths.data_ptr(),
-        key_scale.data_ptr(),
-        value_scale.data_ptr(),
+        0 if is_bf16_kv else key_scale.data_ptr(),
+        0 if is_bf16_kv else value_scale.data_ptr(),
         work_indptr.data_ptr(),
         work_info_flat.data_ptr(),
         kv_page_indices.data_ptr(),
@@ -637,10 +668,10 @@ def pa_decode_ps_launch(
         partition_indptr.data_ptr(),
         query.stride(0),
         query.stride(1),
-        key_cache.stride(0),
-        key_cache.stride(1),
-        value_cache.stride(0),
-        value_cache.stride(1),
+        key_cache.stride(0) * key_cache.element_size(),
+        key_cache.stride(1) * key_cache.element_size(),
+        value_cache.stride(0) * value_cache.element_size(),
+        value_cache.stride(1) * value_cache.element_size(),
         output.stride(0),
         output.stride(1),
         stride_po_partial,

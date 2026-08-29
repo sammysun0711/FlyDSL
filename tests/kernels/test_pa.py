@@ -516,8 +516,8 @@ def run_flydsl_ps(
     kv_page_indices: torch.Tensor,
     kv_indptr: torch.Tensor,
     softmax_scale: float,
-    key_scale: Union[float, torch.Tensor],
-    value_scale: Union[float, torch.Tensor],
+    key_scale: Optional[Union[float, torch.Tensor]],
+    value_scale: Optional[Union[float, torch.Tensor]],
     metadata: Dict[str, torch.Tensor],
     *,
     sliding_window: int,
@@ -584,8 +584,8 @@ def run_pa_decode_ps_test(
 ) -> Dict[str, Union[float, int, str, bool, Tuple[int, int]]]:
     if not HAS_FLYDSL_PS:
         raise RuntimeError("FlyDSL `pa_decode_ps_launch` is not available.")
-    if compute_type != aiter.dtypes.fp8:
-        raise ValueError("This PS-only harness only keeps fp8 cases.")
+    if compute_type not in (aiter.dtypes.fp8, torch.bfloat16):
+        raise ValueError("This PS-only harness supports FP8 or BF16 KV cases.")
     value_head_size = head_size if value_head_size is None else value_head_size
     results: Dict[str, Union[float, int, str, bool, Tuple[int, int]]] = {
         "compute_type": dtype_to_name(compute_type),
@@ -653,7 +653,7 @@ def run_pa_decode_ps_test(
         data_type,
         seed,
         str(device),
-        1,
+        1 if compute_type == aiter.dtypes.fp8 else compute_type.itemsize,
         value_head_size,
     )
     key_cache = key_caches[0]
@@ -661,7 +661,16 @@ def run_pa_decode_ps_test(
 
     query_scale_factors = None
     quantized_query = query
-    if quant_mode == "per_token":
+    if compute_type == torch.bfloat16:
+        if quant_mode != "none":
+            raise ValueError("BF16 KV tests require quant_mode='none'.")
+        quantized_keys = key_cache
+        quantized_values = value_cache
+        key_scale_factors_flat = None
+        value_scale_factors_flat = None
+        key_scale_original = None
+        value_scale_original = None
+    elif quant_mode == "per_token":
         (
             quantized_keys,
             key_scale_factors_flat,
@@ -699,7 +708,7 @@ def run_pa_decode_ps_test(
         sliding_window=sliding_window,
     ).to(data_type)
     quantized_values = shuffle_value_cache_layout(quantized_values) if trans_v else quantized_values
-    if HAS_GLUON and value_head_size == head_size:
+    if HAS_GLUON and compute_type == aiter.dtypes.fp8 and value_head_size == head_size:
         max_context_partition_num = get_gluon_partition_count(
             batch_size,
             num_kv_heads,
@@ -770,10 +779,10 @@ def run_pa_decode_ps_test(
         num_query_heads,
         num_kv_heads,
         value_head_size=value_head_size,
-        per_token_kv=quant_mode == "per_token",
+        per_token_kv=compute_type == aiter.dtypes.fp8 and quant_mode == "per_token",
     )
-    ps_key_scale: torch.Tensor = key_scale_original
-    ps_value_scale: torch.Tensor = value_scale_original
+    ps_key_scale: Optional[torch.Tensor] = key_scale_original
+    ps_value_scale: Optional[torch.Tensor] = value_scale_original
     flydsl_ps_output = torch.empty_like(reference_output)
 
     # Match pa_decode_ps_kernel: each split unit is one 256-token partition,
@@ -847,7 +856,7 @@ def run_pa_decode_ps_test(
         torch.cuda.synchronize()
         torch.testing.assert_close(flydsl_ps_output, reference_output, atol=ps_tol, rtol=ps_tol)
 
-    if HAS_GLUON and value_head_size == head_size:
+    if HAS_GLUON and compute_type == aiter.dtypes.fp8 and value_head_size == head_size:
         results["us_gluon"] = gluon_time
 
     results["us_flydsl_ps"] = flydsl_ps_time
@@ -1343,7 +1352,7 @@ def test_tile_pa_vectorized_5d_matches_torch(
 @pytest.mark.parametrize(
     ("compute_type", "block_size", "sliding_window"),
     [
-        pytest.param("bf16", 1024, 0, id="bf16-page1024"),
+        pytest.param("bf16", 1024, 128, id="bf16-sliding-window"),
         pytest.param("fp8", 64, 128, id="asymmetric-fp8-sliding-window"),
     ],
 )
@@ -1386,7 +1395,7 @@ def test_pa_decode_ps_rejects_unsupported_bf16_asymmetric_paths(
 
     with pytest.raises(
         ValueError,
-        match="BF16 KV currently requires|asymmetric value dimensions are not supported",
+        match="BF16 KV and asymmetric value dimensions are not supported",
     ):
         flydsl_ps_launch(
             output=output,
@@ -1430,6 +1439,35 @@ def test_pa_decode_ps_rejects_non_divisible_gqa_heads() -> None:
             softmax_scale=192**-0.5,
             block_tables=torch.zeros((1, 1), dtype=torch.int32, device=device),
             max_context_partition_num=1,
+        )
+
+
+@pytest.mark.l2_device
+@pytest.mark.rocm_lower
+@_requires_tile_pa
+def test_pa_decode_ps_rejects_bf16_metadata_scales() -> None:
+    if not HAS_FLYDSL_PS:
+        pytest.skip("FlyDSL `pa_decode_ps_launch` is not available")
+
+    device = torch.device("cuda:0")
+    query = torch.empty(1, 16, 192, dtype=torch.bfloat16, device=device)
+    output = torch.empty(1, 16, 128, dtype=torch.bfloat16, device=device)
+    key_cache = torch.empty(1, 1, 24, 1024, 8, dtype=torch.bfloat16, device=device)
+    value_cache = torch.empty(1, 1, 128, 128, 8, dtype=torch.bfloat16, device=device)
+    scale = torch.ones(1, dtype=torch.float32, device=device)
+
+    with pytest.raises(ValueError, match="requires key_scale and value_scale to be None"):
+        flydsl_ps_launch(
+            output=output,
+            query=query,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            context_lengths=torch.ones(1, dtype=torch.int32, device=device),
+            kv_page_indices=torch.zeros(1, dtype=torch.int32, device=device),
+            kv_indptr=torch.tensor([0, 1], dtype=torch.int32, device=device),
+            softmax_scale=192**-0.5,
+            key_scale=scale,
+            value_scale=scale,
         )
 
 
@@ -1573,18 +1611,21 @@ def test_metadata_accuracy(query_length: int, quant_mode: str, head_size: int) -
 @pytest.mark.rocm_lower
 @_requires_tile_pa
 @pytest.mark.parametrize(
-    ("query_length", "quant_mode", "capture_flydsl"),
+    ("compute_type", "query_length", "quant_mode", "capture_flydsl"),
     [
-        pytest.param(1, "per_tensor", False, id="qlen1-per-tensor"),
-        pytest.param(4, "per_token", True, id="qlen4-per-token-graph"),
+        pytest.param("fp8", 1, "per_tensor", False, id="fp8-qlen1-per-tensor"),
+        pytest.param("fp8", 4, "per_token", True, id="fp8-qlen4-per-token-graph"),
+        pytest.param("bf16", 1, "none", False, id="bf16-qlen1"),
+        pytest.param("bf16", 4, "none", True, id="bf16-qlen4-graph"),
     ],
 )
 def test_metadata_qk192_v128_accuracy(
+    compute_type: str,
     query_length: int,
     quant_mode: str,
     capture_flydsl: bool,
 ) -> None:
-    """Cover FP8 page-1024 Q/K192-V128 metadata decode and reduction."""
+    """Cover FP8/BF16 page-1024 Q/K192-V128 metadata decode and reduction."""
     result = run_pa_decode_ps_test(
         context_length=1027,
         batch_size=3,
@@ -1592,7 +1633,7 @@ def test_metadata_qk192_v128_accuracy(
         head_size=192,
         value_head_size=128,
         block_size=1024,
-        compute_type=dtypes.d_dtypes["fp8"],
+        compute_type=dtypes.d_dtypes[compute_type],
         query_length=query_length,
         quant_mode=quant_mode,
         context_partition_size=256,

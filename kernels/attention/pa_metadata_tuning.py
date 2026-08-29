@@ -29,6 +29,7 @@ PA_METADATA_GRID_KEY = [
     "head_dim",
     "block_size",
     "value_head_dim",
+    "kv_dtype",
 ]
 
 
@@ -47,6 +48,7 @@ def run_pa_metadata_grid_config(
     grid_multiplier,
     *,
     value_head_dim=None,
+    kv_dtype="fp8",
 ):
     del device_tensor
     if runner is None:
@@ -107,6 +109,7 @@ def lookup_pa_metadata_grid_multiplier(
     block_size: int,
     device_tensor,
     value_head_dim: int | None = None,
+    kv_dtype: str = "fp8",
 ) -> int | None:
     if value_head_dim is None:
         value_head_dim = head_dim
@@ -123,7 +126,12 @@ def lookup_pa_metadata_grid_multiplier(
         device_tensor,
         None,
     )
-    config = get_cached_config(_RUNTIME_TUNER, *args, value_head_dim=value_head_dim)
+    config = get_cached_config(
+        _RUNTIME_TUNER,
+        *args,
+        value_head_dim=value_head_dim,
+        kv_dtype=kv_dtype,
+    )
     if config is None:
         return None
     return int(config.kwargs["grid_multiplier"])
@@ -164,6 +172,7 @@ def _tune_shape(
     rounds: int,
     device,
     value_head_dim: int | None = None,
+    kv_dtype: str = "fp8",
 ):
     import torch
 
@@ -171,12 +180,18 @@ def _tune_shape(
 
     if value_head_dim is None:
         value_head_dim = head_dim
+    if kv_dtype not in ("fp8", "bf16"):
+        raise ValueError(f"kv_dtype must be 'fp8' or 'bf16', got {kv_dtype!r}")
+    if kv_dtype == "bf16" and per_token_kv:
+        raise ValueError("BF16 KV tuning does not use per-token scales")
     pages_per_sequence = (context_length + block_size - 1) // block_size
     num_blocks = batch_size * pages_per_sequence
     device_properties = torch.cuda.get_device_properties(device)
     num_cu = device_properties.multi_processor_count
     arch = device_properties.gcnArchName.split(":", 1)[0]
     fp8_dtype = torch.float8_e4m3fn if arch.startswith("gfx95") else torch.float8_e4m3fnuz
+    cache_dtype = torch.bfloat16 if kv_dtype == "bf16" else fp8_dtype
+    vector_width = 8 if kv_dtype == "bf16" else 16
     context_lengths = torch.full((batch_size,), context_length, dtype=torch.int32, device=device)
     query = torch.zeros(
         (batch_size * query_length, num_query_heads, head_dim),
@@ -186,16 +201,19 @@ def _tune_shape(
     kv_indptr = torch.arange(batch_size + 1, dtype=torch.int32, device=device) * pages_per_sequence
     kv_page_indices = torch.arange(num_blocks, dtype=torch.int32, device=device)
     key = torch.zeros(
-        (num_blocks, num_kv_heads, head_dim // 16, block_size, 16),
-        dtype=fp8_dtype,
+        (num_blocks, num_kv_heads, head_dim // vector_width, block_size, vector_width),
+        dtype=cache_dtype,
         device=device,
     )
     value = torch.ones(
-        (num_blocks, num_kv_heads, block_size // 16, value_head_dim, 16),
-        dtype=fp8_dtype,
+        (num_blocks, num_kv_heads, block_size // vector_width, value_head_dim, vector_width),
+        dtype=cache_dtype,
         device=device,
     )
-    if per_token_kv:
+    if kv_dtype == "bf16":
+        key_scale = None
+        value_scale = None
+    elif per_token_kv:
         key_scale = torch.ones((num_blocks, num_kv_heads, block_size), dtype=torch.float32, device=device)
         value_scale = torch.ones_like(key_scale)
     else:
@@ -291,8 +309,13 @@ def _tune_shape(
         query,
         replay_grid,
     )
-    tuner(*tuner_args, value_head_dim=value_head_dim)
-    best_config = get_cached_config(tuner, *tuner_args, value_head_dim=value_head_dim)
+    tuner(*tuner_args, value_head_dim=value_head_dim, kv_dtype=kv_dtype)
+    best_config = get_cached_config(
+        tuner,
+        *tuner_args,
+        value_head_dim=value_head_dim,
+        kv_dtype=kv_dtype,
+    )
     best_grid = int(best_config.kwargs["grid_multiplier"])
     torch.cuda.synchronize(device)
 
@@ -303,7 +326,12 @@ def _tune_shape(
         rtol=2e-2,
     ):
         raise RuntimeError(f"grid_multiplier={best_grid} failed correctness")
-    config_path = persistent_config_path(tuner, *tuner_args, value_head_dim=value_head_dim)
+    config_path = persistent_config_path(
+        tuner,
+        *tuner_args,
+        value_head_dim=value_head_dim,
+        kv_dtype=kv_dtype,
+    )
     return best_grid, timings_us.get(best_grid), config_path
 
 
@@ -321,6 +349,7 @@ def main() -> None:
     parser.add_argument("--num-kv-heads", type=int, default=1)
     parser.add_argument("--head-dim", type=int, default=128)
     parser.add_argument("--value-head-dim", type=int, default=None)
+    parser.add_argument("--kv-dtype", choices=("fp8", "bf16"), default="fp8")
     parser.add_argument("--block-size", type=int, default=1024)
     args = parser.parse_args()
 
@@ -343,6 +372,7 @@ def main() -> None:
             num_kv_heads=args.num_kv_heads,
             head_dim=args.head_dim,
             value_head_dim=value_head_dim,
+            kv_dtype=args.kv_dtype,
             block_size=args.block_size,
             warmup=args.warmup,
             iterations=args.iterations,

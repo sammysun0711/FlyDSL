@@ -44,6 +44,7 @@ def get_pa_metadata(
     *,
     per_token_kv: bool | None = None,
     grid_multiplier: int | None = None,
+    value_head_size: int | None = None,
 ):
     """Compute PA metadata (worklist, reduce maps) via get_pa_metadata_v1.
 
@@ -74,6 +75,8 @@ def get_pa_metadata(
     batch_size = context_lengths.shape[0]
     query_length = query.shape[0] // batch_size
     head_size = query.shape[-1]
+    if value_head_size is None:
+        value_head_size = head_size
 
     props = torch.cuda.get_device_properties(dev)
     num_blocks = key_cache.shape[0]
@@ -87,6 +90,7 @@ def get_pa_metadata(
             num_query_heads=num_query_heads,
             num_kv_heads=num_kv_heads,
             head_dim=head_size,
+            value_head_dim=value_head_size,
             block_size=key_cache.shape[-2],
             device_tensor=query,
         )
@@ -149,13 +153,15 @@ def get_pa_metadata(
     num_partials = int(reduce_indptr[-1].item())
     max_qlen = query_length
     partial_output = torch.empty(
-        ((num_partials + 1) * max_qlen, 1, num_query_heads, head_size), dtype=torch.float32, device=dev
+        ((num_partials + 1) * max_qlen, 1, num_query_heads, value_head_size),
+        dtype=torch.float32,
+        device=dev,
     )
     partial_lse = torch.empty(((num_partials + 1) * max_qlen, 1, num_query_heads, 1), dtype=torch.float32, device=dev)
 
-    stride_po_partial = query_length * num_query_heads * head_size
+    stride_po_partial = query_length * num_query_heads * value_head_size
     stride_pl_partial = query_length * num_query_heads
-    stride_po_ql = num_query_heads * head_size
+    stride_po_ql = num_query_heads * value_head_size
     stride_pl_ql = num_query_heads
 
     return {
@@ -173,6 +179,8 @@ def get_pa_metadata(
         "stride_po_ql": stride_po_ql,
         "stride_pl_ql": stride_pl_ql,
         "query_length": query_length,
+        "qk_head_size": head_size,
+        "value_head_size": value_head_size,
     }
 
 
@@ -230,6 +238,45 @@ def _get_output_dtype_str(output: torch.Tensor) -> str:
     raise ValueError(
         f"Unsupported output dtype for pa_decode_ps_launch reduce: {output.dtype}. " "Expected bf16, f16, or f32."
     )
+
+
+def _validate_metadata_cache_shapes(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    """Validate the FP8 metadata-kernel cache layouts."""
+    if key_cache.ndim != 5:
+        raise ValueError(f"metadata key cache must be 5D, got shape {tuple(key_cache.shape)}")
+    if value_cache.ndim not in (4, 5):
+        raise ValueError(f"metadata value cache must be 4D or 5D, got shape {tuple(value_cache.shape)}")
+    if key_cache.dtype != value_cache.dtype or key_cache.element_size() != 1:
+        raise ValueError(
+            "metadata decode requires matching FP8 key/value cache dtypes; "
+            f"got key={key_cache.dtype}, value={value_cache.dtype}."
+        )
+
+    num_blocks, num_kv_heads, key_chunks, block_size, key_vector_width = key_cache.shape
+    qk_head_size = key_chunks * key_vector_width
+    if qk_head_size != query.shape[-1]:
+        raise ValueError(f"key cache Q/K head size ({qk_head_size}) must match query head size ({query.shape[-1]}).")
+    if value_cache.shape[:2] != (num_blocks, num_kv_heads):
+        raise ValueError(
+            "key/value caches must have matching block and KV-head dimensions; "
+            f"got key={tuple(key_cache.shape[:2])}, value={tuple(value_cache.shape[:2])}."
+        )
+
+    if value_cache.ndim == 5:
+        value_block_size = value_cache.shape[2] * value_cache.shape[4]
+        value_head_size = value_cache.shape[3]
+    else:
+        value_head_size = value_cache.shape[2]
+        value_block_size = value_cache.shape[3]
+    if value_block_size != block_size:
+        raise ValueError(f"value cache block size ({value_block_size}) must match key cache block size ({block_size}).")
+    if value_head_size != output.shape[-1]:
+        raise ValueError(f"value cache head size ({value_head_size}) must match output head size ({output.shape[-1]}).")
 
 
 def get_recommended_splits(
@@ -310,13 +357,12 @@ def pa_decode_ps_launch(
     is_graph_capturing = _is_current_stream_capturing()
     s = stream or torch.cuda.current_stream()
 
-    if max_context_partition_num <= 0:
-        raise ValueError("max_context_partition_num must be positive.")
-
     # Small physical pages use the standalone tile kernel. Dispatch before the
     # FP8 metadata/SW setup so BF16 KV stays unscaled and asymmetric V uses the
     # tile wrapper's value-sized workspace allocation and validation.
     if block_size in _PA_DECODE_PS_SMALL_BLOCK_SIZES and sliding_window == 0:
+        if max_context_partition_num <= 0:
+            raise ValueError("max_context_partition_num must be positive for small-page tile decode.")
         if block_tables is None:
             raise ValueError(
                 f"pa_decode_ps_launch: block_size={block_size} requires `block_tables` "
@@ -363,11 +409,11 @@ def pa_decode_ps_launch(
 
     is_bf16_kv = key_cache.dtype == torch.bfloat16
     is_asymmetric = value_head_size != head_size
-    if is_bf16_kv or is_asymmetric:
+    if is_bf16_kv or (is_asymmetric and sliding_window > 0):
         unsupported_path = "sliding-window" if sliding_window > 0 else "page-1024 metadata"
         raise ValueError(
-            "BF16 KV and asymmetric value dimensions currently require "
-            "block_size 16 or 64 with sliding_window=0; "
+            "BF16 KV currently requires block_size 16 or 64 with sliding_window=0, "
+            "and asymmetric value dimensions are not supported by sliding-window decode; "
             f"the {unsupported_path} path is not supported."
         )
 
@@ -395,7 +441,13 @@ def pa_decode_ps_launch(
     stride_ks_block = key_scale.stride(0) if per_token_kv else 0
     stride_ks_head = key_scale.stride(1) if per_token_kv else 0
 
-    if is_graph_capturing and (exp_sums is None or max_logits is None or temporary_output is None):
+    if sliding_window > 0 and max_context_partition_num <= 0:
+        raise ValueError("max_context_partition_num must be positive for sliding-window decode.")
+    if (
+        sliding_window > 0
+        and is_graph_capturing
+        and (exp_sums is None or max_logits is None or temporary_output is None)
+    ):
         raise ValueError(
             "CUDA graph capture requires preallocated `exp_sums`, `max_logits`, "
             "and `temporary_output` for the sliding-window path."
@@ -527,7 +579,18 @@ def pa_decode_ps_launch(
             kv_indptr,
             num_query_heads,
             num_kv_heads,
+            value_head_size=value_head_size,
             per_token_kv=per_token_kv,
+        )
+
+    _validate_metadata_cache_shapes(query, key_cache, value_cache, output)
+    metadata_qk_head_size = metadata.get("qk_head_size", head_size)
+    metadata_value_head_size = metadata.get("value_head_size", metadata_qk_head_size)
+    if metadata_qk_head_size != head_size or metadata_value_head_size != value_head_size:
+        raise ValueError(
+            "Precomputed page-1024 metadata head dimensions do not match this launch: "
+            f"metadata Q/K={metadata_qk_head_size}, V={metadata_value_head_size}; "
+            f"launch Q/K={head_size}, V={value_head_size}."
         )
 
     work_indptr = metadata["work_indptr"]
@@ -547,12 +610,13 @@ def pa_decode_ps_launch(
         per_token_kv=per_token_kv,
         query_length=query_length,
         query_input_dtype=query_input_dtype,
-        head_dim=int(query.shape[-1]),
+        head_dim=int(head_size),
+        value_head_dim=int(value_head_size),
         block_size=int(metadata_block_size),
         output_dtype_str=_get_output_dtype_str(output),
     )
 
-    stride_po_ql = metadata.get("stride_po_ql", num_query_heads * query.shape[-1])
+    stride_po_ql = metadata.get("stride_po_ql", num_query_heads * value_head_size)
     stride_pl_ql = metadata.get("stride_pl_ql", num_query_heads)
 
     _run_compiled(
@@ -602,7 +666,7 @@ def pa_decode_ps_launch(
         max_seqlen_q=query_length,
         final_output=output,
         num_query_heads=num_query_heads,
-        head_dim=int(query.shape[-1]),
+        head_dim=int(value_head_size),
         stream=s,
     )
 

@@ -204,8 +204,8 @@ def _finish_q_fragments(
     head_dim: int,
 ):
     qkhe_loop = head_dim // QKHE_PER_FETCH
-    q_lanes_per_head = head_dim // Q_ELEMS_PER_LANE
-    lds_q_base = local_qhead_idx * (head_dim // 4) + lane16id * 2
+    q_words_per_lane = head_dim // MFMA_N // 4
+    lds_q_base = local_qhead_idx * (head_dim // 4) + lane16id * q_words_per_lane
     abs_mask = fx.Vector.filled(4, 0x7FFFFFFF, fx.Int32)
 
     q_f32_chunks = []
@@ -233,11 +233,7 @@ def _finish_q_fragments(
         )
 
     q_vec = fx.Vector.from_elements(q_words, dtype=fx.Int32)
-    if const_expr(q_lanes_per_head < MFMA_N):
-        if lane16id < q_lanes_per_head:
-            fx.ptr_store(q_vec, logits_base + lds_q_base)
-    else:
-        fx.ptr_store(q_vec, logits_base + lds_q_base)
+    fx.ptr_store(q_vec, logits_base + lds_q_base)
 
     q_frags = []
     gpu.barrier()
@@ -269,6 +265,7 @@ def _prefetch_mtp_group_query(
     query_length,
     query_group_size,
     q_lanes_per_head,
+    q_elements_per_lane=None,
 ):
     qi_val, qhi_pos, qi_for_q, local_qhead_idx_for_q = _compute_mtp_group_state(
         lane16id,
@@ -286,6 +283,7 @@ def _prefetch_mtp_group_query(
         q_base,
         lane16id,
         q_lanes_per_head=q_lanes_per_head,
+        q_elements_per_lane=q_elements_per_lane,
     )
     return qi_val, qhi_pos, q_chunks
 
@@ -321,9 +319,12 @@ def _make_pa_phase_helpers(
     lane16id,
     rowid,
     head_dim: int = 128,
+    value_head_dim: int | None = None,
 ):
+    if value_head_dim is None:
+        value_head_dim = head_dim
     qkhe_loop = head_dim // QKHE_PER_FETCH
-    vhe_loop = head_dim // MFMA_N // NUM_WARPS
+    vhe_loop = value_head_dim // MFMA_N // NUM_WARPS
 
     vhead_elems = [warp_id * MFMA_N + lane16id + vhe * NUM_WARPS * MFMA_N for vhe in range(vhe_loop)]
     v_tok_thread_off = [rowid * MFMA_N + vt * TOKENS_PER_WARP for vt in range(VTLOOP)]
@@ -386,7 +387,7 @@ def _make_pa_phase_helpers(
                 v_token_in_block = tile_token_offset_i32 + v_tok_thread_off[vt]
                 if const_expr(trans_v):
                     vt_group = v_token_in_block >> 4
-                    va_dw_delta = vt_group * (head_dim * FP8_ELEMS_16B // 4) + vhead_elem_dw[vhe]
+                    va_dw_delta = vt_group * (value_head_dim * FP8_ELEMS_16B // 4) + vhead_elem_dw[vhe]
                 else:
                     va_dw_delta = vhead_elem_dw[vhe] + (v_token_in_block >> 2)
                 va_byte = (v_block_base_dw + fx.Int64(va_dw_delta)) * 4
@@ -943,6 +944,8 @@ def compile_pa_decode_metadata(
     head_dim: int = 128,
     block_size: int = KV_BLOCK_SIZE,
     output_dtype_str: str = "bf16",
+    *,
+    value_head_dim: int | None = None,
 ):
     """Compile a PS-mode PA decode kernel.
 
@@ -956,19 +959,34 @@ def compile_pa_decode_metadata(
     (``work_info[1]``) ``< 0`` writes the final output directly to ``out``, while
     ``>= 0`` writes a partial slot that ``pa_reduce_v1`` later combines.
     """
+    qk_head_dim = head_dim
+    if value_head_dim is None:
+        value_head_dim = qk_head_dim
     if block_size != KV_BLOCK_SIZE:
         raise ValueError(f"compile_pa_decode_metadata only supports block_size={KV_BLOCK_SIZE}, got {block_size}")
-    if head_dim % QKHE_PER_FETCH != 0 or head_dim % (MFMA_N * NUM_WARPS) != 0 or head_dim % Q_ELEMS_PER_LANE != 0:
-        raise ValueError(f"Unsupported head_dim={head_dim}; must be a multiple of {MFMA_N * NUM_WARPS}.")
-    QKHELOOP = head_dim // QKHE_PER_FETCH
-    VHELOOP = head_dim // MFMA_N // NUM_WARPS
-    Q_LANES_PER_HEAD = head_dim // Q_ELEMS_PER_LANE
+    if (
+        qk_head_dim % QKHE_PER_FETCH != 0
+        or qk_head_dim % (MFMA_N * NUM_WARPS) != 0
+        or qk_head_dim % Q_ELEMS_PER_LANE != 0
+    ):
+        raise ValueError(f"Unsupported qk_head_dim={qk_head_dim}; " f"must be a multiple of {MFMA_N * NUM_WARPS}.")
+    if value_head_dim % (MFMA_N * NUM_WARPS) != 0:
+        raise ValueError(
+            f"Unsupported value_head_dim={value_head_dim}; " f"must be a multiple of {MFMA_N * NUM_WARPS}."
+        )
+    QKHELOOP = qk_head_dim // QKHE_PER_FETCH
+    VHELOOP = value_head_dim // MFMA_N // NUM_WARPS
+    Q_ELEMENTS_PER_LANE = qk_head_dim // MFMA_N
+    if Q_ELEMENTS_PER_LANE % 4 != 0:
+        raise ValueError(
+            f"Unsupported qk_head_dim={qk_head_dim}; each query lane must own a multiple of four elements."
+        )
     if query_input_dtype not in ("bf16", "f16"):
         raise ValueError(f"`compile_pa_decode_metadata` only supports bf16/f16 queries, got {query_input_dtype!r}")
     QUERY_DTYPE = dtype_to_elem_type(query_input_dtype)
     OUTPUT_DTYPE = dtype_to_elem_type(output_dtype_str)
     if softmax_scale is None:
-        softmax_scale = 1.0 / (head_dim**0.5)
+        softmax_scale = 1.0 / (qk_head_dim**0.5)
     softmax_scale = float(softmax_scale)
     parts_per_block = KV_BLOCK_SIZE // KV_COMPUTE_BLOCK
 
@@ -986,10 +1004,10 @@ def compile_pa_decode_metadata(
 
     @flyc.kernel(known_block_size=(BLOCK_THREADS, 1, 1))
     def pa_decode_metadata_kernel(
-        out_ptr: fx.Int64,  # output [batch, num_q_heads, head_dim]
-        partial_out_ptr: fx.Int64,  # partial output [num_partials, 1, nhead, head_dim] fp32
+        out_ptr: fx.Int64,  # output [batch, num_q_heads, value_head_dim]
+        partial_out_ptr: fx.Int64,  # partial output [num_partials, 1, nhead, value_head_dim] fp32
         partial_lse_ptr: fx.Int64,  # partial LSE [num_partials, 1, nhead, 1] fp32
-        query_ptr: fx.Int64,  # queries [batch, num_q_heads, head_dim]
+        query_ptr: fx.Int64,  # queries [batch, num_q_heads, qk_head_dim]
         key_cache_ptr: fx.Int64,  # key cache
         value_cache_ptr: fx.Int64,  # value cache
         context_lengths_ptr: fx.Int64,  # [batch] int32
@@ -1008,11 +1026,11 @@ def compile_pa_decode_metadata(
         stride_v_head: fx.Int32,
         stride_out_seq: fx.Int32,
         stride_out_head: fx.Int32,
-        stride_po_partial: fx.Int32,  # stride for partial_output partial dim (nhead * head_dim)
+        stride_po_partial: fx.Int32,  # stride for partial_output partial dim (nhead * value_head_dim)
         stride_pl_partial: fx.Int32,  # stride for partial_lse partial dim (nhead)
         stride_ks_block: fx.Int32,  # key_scale stride for block dim (num_kv_heads * KV_BLOCK_SIZE); 0 for per-tensor
         stride_ks_head: fx.Int32,  # key_scale stride for head dim (KV_BLOCK_SIZE); 0 for per-tensor
-        stride_po_ql: fx.Int32,  # stride for partial_output query-length dim (num_query_heads * head_dim)
+        stride_po_ql: fx.Int32,  # stride for partial_output query-length dim (num_query_heads * value_head_dim)
         stride_pl_ql: fx.Int32,  # stride for partial_lse query-length dim (num_query_heads)
     ):
         tid = fx.Int32(gpu.thread_id("x"))
@@ -1144,7 +1162,8 @@ def compile_pa_decode_metadata(
                 warp_id=warp_id,
                 lane16id=lane16id,
                 rowid=rowid,
-                head_dim=head_dim,
+                head_dim=qk_head_dim,
+                value_head_dim=value_head_dim,
             )
 
             # Negative partial_idx writes final output; split rows reserve the first QL slots.
@@ -1176,7 +1195,8 @@ def compile_pa_decode_metadata(
                     mtp_group_idx=_mtp_g,
                     query_length=query_length,
                     query_group_size=query_group_size,
-                    q_lanes_per_head=Q_LANES_PER_HEAD,
+                    q_lanes_per_head=MFMA_N,
+                    q_elements_per_lane=Q_ELEMENTS_PER_LANE,
                 )
                 _qfrags, _qscale = _finish_q_fragments(
                     logits_base,
@@ -1185,7 +1205,7 @@ def compile_pa_decode_metadata(
                     lane16id,
                     rowid,
                     local_qhead_idx,
-                    head_dim=head_dim,
+                    head_dim=qk_head_dim,
                 )
                 qi_per_mtp.append(_qi)
                 qhi_per_mtp.append(_qhi)
@@ -1316,7 +1336,7 @@ def compile_pa_decode_metadata(
                     _po_row = _po_row_base + qi_val_mg
                     for vhe in range_constexpr(VHELOOP):
                         hs_base = vhe * NUM_WARPS * MFMA_N + warp_id * MFMA_N + rowid * 4
-                        po_off = _po_row * stride_po_ql + qhead * head_dim + hs_base
+                        po_off = _po_row * stride_po_ql + qhead * value_head_dim + hs_base
                         fx.memref_store_vec(outelems_norm[vhe], partial_out_reg)
                         fx.copy(
                             copy_f32x4,
@@ -1411,9 +1431,10 @@ def compile_pa_metadata_reduce(
     head_dim: int,
     output_dtype_str: str,
 ):
-    vec_width = 2 if head_dim % 2 == 0 else 1
-    block_threads = head_dim // vec_width
-    assert 0 < block_threads <= 1024, "head_dim must fit in one workgroup"
+    value_head_dim = head_dim
+    vec_width = 2 if value_head_dim % 2 == 0 else 1
+    block_threads = value_head_dim // vec_width
+    assert 0 < block_threads <= 1024, "value_head_dim must fit in one workgroup"
     output_dtype = dtype_to_elem_type(output_dtype_str)
 
     @flyc.kernel(known_block_size=(block_threads, 1, 1))
@@ -1426,7 +1447,7 @@ def compile_pa_metadata_reduce(
         reduce_partial_map_ptr: fx.Tensor,
         stride_out_seq: fx.Int32,
         stride_out_head: fx.Int32,
-        stride_po_row: fx.Int32,  # num_query_heads * head_dim
+        stride_po_row: fx.Int32,  # num_query_heads * value_head_dim
         stride_pl_row: fx.Int32,  # num_query_heads
     ):
         tid = fx.Int32(gpu.thread_id("x"))
@@ -1492,7 +1513,7 @@ def compile_pa_metadata_reduce(
                 lse = copy_load(partial_lse, prow * stride_pl_row + qhead, copy_f32, reg_f32)[0]
                 v = copy_load(
                     partial_output,
-                    prow * stride_po_row + qhead * head_dim + tid * vec_width,
+                    prow * stride_po_row + qhead * value_head_dim + tid * vec_width,
                     copy_f32_vec,
                     reg_f32_vec,
                 )
@@ -1569,14 +1590,15 @@ def pa_metadata_reduce(
     per batch tile; empty groups (``reduce_indptr`` delta 0 — direct outputs) skip
     in-kernel, so passing ``reduce_indptr.numel() - 1`` groups needs no host sync.
     """
+    value_head_dim = head_dim
     num_groups = reduce_indptr.numel() - 1
-    stride_po_row = num_query_heads * head_dim
+    stride_po_row = num_query_heads * value_head_dim
     stride_pl_row = num_query_heads
     out_dtype_str = get_dtype_str(final_output.dtype)
     compiled = compile_pa_metadata_reduce(
         query_length=int(max_seqlen_q),
         num_query_heads=int(num_query_heads),
-        head_dim=int(head_dim),
+        head_dim=int(value_head_dim),
         output_dtype_str=out_dtype_str,
     )
     _run_compiled(

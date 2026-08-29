@@ -28,6 +28,7 @@ PA_METADATA_GRID_KEY = [
     "num_kv_heads",
     "head_dim",
     "block_size",
+    "value_head_dim",
 ]
 
 
@@ -44,6 +45,8 @@ def run_pa_metadata_grid_config(
     device_tensor,
     runner,
     grid_multiplier,
+    *,
+    value_head_dim=None,
 ):
     del device_tensor
     if runner is None:
@@ -103,7 +106,10 @@ def lookup_pa_metadata_grid_multiplier(
     head_dim: int,
     block_size: int,
     device_tensor,
+    value_head_dim: int | None = None,
 ) -> int | None:
+    if value_head_dim is None:
+        value_head_dim = head_dim
     args = (
         batch_size,
         num_blocks,
@@ -117,7 +123,7 @@ def lookup_pa_metadata_grid_multiplier(
         device_tensor,
         None,
     )
-    config = get_cached_config(_RUNTIME_TUNER, *args)
+    config = get_cached_config(_RUNTIME_TUNER, *args, value_head_dim=value_head_dim)
     if config is None:
         return None
     return int(config.kwargs["grid_multiplier"])
@@ -157,14 +163,20 @@ def _tune_shape(
     iterations: int,
     rounds: int,
     device,
+    value_head_dim: int | None = None,
 ):
     import torch
 
     from kernels.attention.pa_decode_fp8 import get_pa_metadata, pa_decode_ps_launch
 
+    if value_head_dim is None:
+        value_head_dim = head_dim
     pages_per_sequence = (context_length + block_size - 1) // block_size
     num_blocks = batch_size * pages_per_sequence
-    num_cu = torch.cuda.get_device_properties(device).multi_processor_count
+    device_properties = torch.cuda.get_device_properties(device)
+    num_cu = device_properties.multi_processor_count
+    arch = device_properties.gcnArchName.split(":", 1)[0]
+    fp8_dtype = torch.float8_e4m3fn if arch.startswith("gfx95") else torch.float8_e4m3fnuz
     context_lengths = torch.full((batch_size,), context_length, dtype=torch.int32, device=device)
     query = torch.zeros(
         (batch_size * query_length, num_query_heads, head_dim),
@@ -175,12 +187,12 @@ def _tune_shape(
     kv_page_indices = torch.arange(num_blocks, dtype=torch.int32, device=device)
     key = torch.zeros(
         (num_blocks, num_kv_heads, head_dim // 16, block_size, 16),
-        dtype=torch.float8_e4m3fnuz,
+        dtype=fp8_dtype,
         device=device,
     )
     value = torch.ones(
-        (num_blocks, num_kv_heads, block_size // 16, head_dim, 16),
-        dtype=torch.float8_e4m3fnuz,
+        (num_blocks, num_kv_heads, block_size // 16, value_head_dim, 16),
+        dtype=fp8_dtype,
         device=device,
     )
     if per_token_kv:
@@ -190,7 +202,11 @@ def _tune_shape(
         key_scale = torch.ones((1,), dtype=torch.float32, device=device)
         value_scale = torch.ones((1,), dtype=torch.float32, device=device)
 
-    output = torch.empty_like(query)
+    output = torch.empty(
+        (batch_size * query_length, num_query_heads, value_head_dim),
+        dtype=query.dtype,
+        device=device,
+    )
     graphs = {}
     metadata_resources = []
     for grid_multiplier in candidates:
@@ -201,6 +217,7 @@ def _tune_shape(
             kv_indptr,
             num_query_heads,
             num_kv_heads,
+            value_head_size=value_head_dim,
             per_token_kv=per_token_kv,
             grid_multiplier=grid_multiplier,
         )
@@ -274,8 +291,8 @@ def _tune_shape(
         query,
         replay_grid,
     )
-    tuner(*tuner_args)
-    best_config = get_cached_config(tuner, *tuner_args)
+    tuner(*tuner_args, value_head_dim=value_head_dim)
+    best_config = get_cached_config(tuner, *tuner_args, value_head_dim=value_head_dim)
     best_grid = int(best_config.kwargs["grid_multiplier"])
     torch.cuda.synchronize(device)
 
@@ -286,7 +303,7 @@ def _tune_shape(
         rtol=2e-2,
     ):
         raise RuntimeError(f"grid_multiplier={best_grid} failed correctness")
-    config_path = persistent_config_path(tuner, *tuner_args)
+    config_path = persistent_config_path(tuner, *tuner_args, value_head_dim=value_head_dim)
     return best_grid, timings_us.get(best_grid), config_path
 
 
@@ -303,6 +320,7 @@ def main() -> None:
     parser.add_argument("--num-query-heads", type=int, default=16)
     parser.add_argument("--num-kv-heads", type=int, default=1)
     parser.add_argument("--head-dim", type=int, default=128)
+    parser.add_argument("--value-head-dim", type=int, default=None)
     parser.add_argument("--block-size", type=int, default=1024)
     args = parser.parse_args()
 
@@ -311,6 +329,7 @@ def main() -> None:
 
     torch.cuda.set_device(args.device)
     device = torch.device("cuda", args.device)
+    value_head_dim = args.head_dim if args.value_head_dim is None else args.value_head_dim
     config_path = None
 
     for batch_size, context_length, query_length, per_token_kv in args.shape:
@@ -323,6 +342,7 @@ def main() -> None:
             num_query_heads=args.num_query_heads,
             num_kv_heads=args.num_kv_heads,
             head_dim=args.head_dim,
+            value_head_dim=value_head_dim,
             block_size=args.block_size,
             warmup=args.warmup,
             iterations=args.iterations,

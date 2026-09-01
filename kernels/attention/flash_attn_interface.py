@@ -424,6 +424,8 @@ def _build_paged_fp8(
 # gfx950 dualwave paged-KV currently supports exactly one configuration.
 _PAGED_PAGE_SIZE = 64
 _PAGED_BT_LDS_SIZE = 2048
+_PAGED_FP8_GATHER_DENSE_MAX_Q = 4096
+_PAGED_FP8_GATHER_DENSE_MAX_KV = 8192
 
 
 def _flydsl_flash_attn_paged(
@@ -672,20 +674,28 @@ def _flydsl_flash_attn_paged(
         if paged_fp8:
             num_kv_pages = (skv + page_size - 1) // page_size
             use_bn128 = fp8_head_dims == (128, 128) and B == 1 and num_kv_pages % 2 == 0
+            use_gather_dense = (
+                fp8_head_dims == (128, 128)
+                and B == 1
+                and Sq <= _PAGED_FP8_GATHER_DENSE_MAX_Q
+                and skv <= _PAGED_FP8_GATHER_DENSE_MAX_KV
+            )
             paged_setprio = dualwave_swp_setprio and D != 192
             paged_stagger = dualwave_swp_enable_stagger and not (fp8_head_dims == (192, 192) and skv >= 65536)
-            exe = _build_paged_fp8(
-                num_heads=H,
-                num_kv_heads=num_kv_heads,
-                head_dim=D,
-                value_head_dim=value_head_dim,
-                waves_per_eu=waves_per_eu,
-                daz=daz,
-                lazy_rescale=dualwave_swp_lazy_rescale,
-                setprio=paged_setprio,
-                enable_stagger=paged_stagger,
-                use_bn128=use_bn128,
-            )
+            exe = None
+            if not use_gather_dense:
+                exe = _build_paged_fp8(
+                    num_heads=H,
+                    num_kv_heads=num_kv_heads,
+                    head_dim=D,
+                    value_head_dim=value_head_dim,
+                    waves_per_eu=waves_per_eu,
+                    daz=daz,
+                    lazy_rescale=dualwave_swp_lazy_rescale,
+                    setprio=paged_setprio,
+                    enable_stagger=paged_stagger,
+                    use_bn128=use_bn128,
+                )
         elif _paged_light_ok:
             exe = _build_paged_light(
                 num_heads=H,
@@ -732,6 +742,40 @@ def _flydsl_flash_attn_paged(
             if out is None:
                 out_dtype = torch.bfloat16 if paged_fp8 else q.dtype
                 out = torch.empty(expected_out_shape, dtype=out_dtype, device=q.device)
+            if paged_fp8 and use_gather_dense:
+                physical_pages = block_table_i32.view(B, -1)[0, :num_kv_pages].to(torch.int64)
+                dense_k = (
+                    k.contiguous()
+                    .index_select(0, physical_pages)
+                    .permute(0, 3, 1, 2, 4)
+                    .reshape(1, num_kv_pages * page_size, Hkv, D)[:, :skv]
+                    .contiguous()
+                )
+                dense_v = (
+                    v.contiguous()
+                    .index_select(0, physical_pages)
+                    .permute(0, 2, 4, 1, 3)
+                    .reshape(1, num_kv_pages * page_size, Hkv, value_head_dim)[:, :skv]
+                    .contiguous()
+                )
+                flydsl_flash_attn_func(
+                    q.contiguous().view(1, Sq, H, D),
+                    dense_k,
+                    dense_v,
+                    causal=True,
+                    num_kv_heads=num_kv_heads,
+                    q_descale=q_descale,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
+                    out=out.view(1, Sq, H, value_head_dim),
+                    waves_per_eu=waves_per_eu,
+                    daz=daz,
+                    dualwave_swp_lazy_rescale=dualwave_swp_lazy_rescale,
+                    dualwave_swp_setprio=dualwave_swp_setprio,
+                    dualwave_swp_enable_stagger=dualwave_swp_enable_stagger,
+                    stream=launch_stream,
+                )
+                return out
             # Keep serving-sized physical K/V caches rank-5 because flattening
             # their dynamic memref shape can exceed signed int32. The FP8
             # schedule consumes Q/O as flat token-major buffers, matching its
